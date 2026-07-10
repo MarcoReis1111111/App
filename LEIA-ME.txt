@@ -1,0 +1,29 @@
+﻿App Engenharia 鈥?Web UI (pacote minimo)
+========================================
+
+Este pacote contem apenas o necessario para App_web_ui_moderno.py.
+
+ESTRUTURA
+  02_WEB_UI\          Codigo Python + servicos + cache config
+  web\vendor\         Assets Gantt (frappe-gantt)
+  Iniciar_Web_UI.bat  Arranque rapido (Python)
+  Compilar_Web_UI.bat Gerar App_web_ui_COMPILADO.py
+  Compilar_Web_UI_EXE.bat  Gerar executavel Windows
+
+PRE-REQUISITOS
+  - Python 3.13
+  - pip install pyodbc pandas openpyxl
+  - ODBC Driver 18 for SQL Server (instalar_prerequisitos.ps1)
+
+ARRANQUE (desenvolvimento)
+  1. Editar 02_WEB_UI\AppEngenhariaCache\config.json (SQL, caminhos)
+  2. Executar Iniciar_Web_UI.bat
+  3. Browser: http://127.0.0.1:8765  (Ctrl+Shift+R apos abrir)
+
+COMPILAR
+  - Ficheiro unico: Compilar_Web_UI.bat
+  - Executavel: Compilar_Web_UI_EXE.bat -> 02_WEB_UI\dist\AppWebUI_Local\
+
+NOTAS
+  - A pasta original 02_WEB_UI na raiz do projeto mantem-se intacta.
+  - Logs e cache de sessao sao criados em 02_WEB_UI\AppEngenhariaCache\ em runtime.
