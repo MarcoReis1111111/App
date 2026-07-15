@@ -14,6 +14,11 @@ from tasks_common import (
 def validate_action_save(v: Dict[str, Any]) -> None:
     if not str(v.get("item_text") or v.get("text") or "").strip():
         raise AppError("Texto da ação é obrigatório")
+    if not str(v.get("owner") or "").strip():
+        raise AppError("Owner é obrigatório")
+    due = str(v.get("due_date") or "").strip()[:10]
+    if not due:
+        raise AppError("Prazo é obrigatório")
     st = str(v.get("status") or "Não iniciado").strip()
     if st not in ACTION_STATUSES:
         raise AppError(f"Estado inválido: {st}")

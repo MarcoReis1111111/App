@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-App Web UI — ponto de entrada v0.14.0.
+App Web UI — ponto de entrada v0.16.4.
 
 Loader sobre bytecode (_app_web_ui_base.cpython-313.pyc) + patches incrementais.
 Serviços em ficheiros *_service.py separados (não é monólito autónomo).
@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
 
-APP_VERSION = "0.15.5"
+APP_VERSION = "0.17.9"
 _BASE_DIR = Path(__file__).resolve().parent
 # Robustez de imports para execucao em diferentes PCs/OneDrive.
 # O bytecode base pode importar modulos "soltos" (ex.: excel_filters.py).
@@ -125,10 +125,102 @@ def _read_multipart_no_cgi(handler: Any) -> _MultipartForm:
     return _MultipartForm([_MultipartField(filename, data)])
 
 
+_WIN_FOLDER_PICKER_PS = ""  # legacy inline script replaced by pick_folder_win.ps1
+
+
+def _runtime_base_dir() -> Path:
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).resolve().parent
+    return _BASE_DIR
+
+
+def _pick_folder_dialog_win_modern(title: str, initial: str, log_fn: Any = None) -> str:
+    """Seletor nativo Windows 10/11 (IFileOpenDialog + pastas)."""
+    from files_service import normalize_folder_path
+
+    ps1 = _runtime_base_dir() / "pick_folder_win.ps1"
+    if not ps1.is_file():
+        if log_fn:
+            log_fn("pick_folder_dialog(win): pick_folder_win.ps1 em falta")
+        return ""
+    try:
+        proc = subprocess.run(
+            [
+                "powershell",
+                "-NoProfile",
+                "-STA",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(ps1),
+                "-Title",
+                str(title or "Selecionar pasta"),
+                "-InitialPath",
+                str(initial or ""),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        lines = [ln.strip() for ln in (proc.stdout or "").splitlines() if ln.strip()]
+        chosen = normalize_folder_path(lines[-1] if lines else "")
+        if chosen:
+            return chosen
+        err = (proc.stderr or "").strip()
+        if err and log_fn:
+            log_fn(f"pick_folder_dialog(win): {err}")
+        elif proc.returncode and log_fn:
+            log_fn(f"pick_folder_dialog(win): exit {proc.returncode}")
+    except subprocess.TimeoutExpired:
+        if log_fn:
+            log_fn("pick_folder_dialog(win): timeout")
+    except Exception as ex:
+        if log_fn:
+            log_fn(f"pick_folder_dialog(win): {ex}")
+    return ""
+
+
+def _pick_folder_dialog_win_legacy(title: str, initial: str, log_fn: Any = None) -> str:
+    """Fallback: FolderBrowserDialog (UI antiga, mas funcional)."""
+    from files_service import normalize_folder_path
+
+    init_ps = str(initial or "").replace("'", "''")
+    title_ps = str(title or "Selecionar pasta").replace("'", "''")
+    ps = (
+        "Add-Type -AssemblyName System.Windows.Forms; "
+        "$d = New-Object System.Windows.Forms.FolderBrowserDialog; "
+        f"$d.Description = '{title_ps}'; "
+        "$d.ShowNewFolderButton = $true; "
+    )
+    if init_ps:
+        ps += f"if (Test-Path -LiteralPath '{init_ps}') {{ $d.SelectedPath = '{init_ps}' }}; "
+    ps += (
+        "$r = $d.ShowDialog(); "
+        "if ($r -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $d.SelectedPath }"
+    )
+    try:
+        proc = subprocess.run(
+            ["powershell", "-NoProfile", "-STA", "-Command", ps],
+            capture_output=True,
+            text=True,
+            timeout=600,
+        )
+        lines = [ln.strip() for ln in (proc.stdout or "").splitlines() if ln.strip()]
+        chosen = normalize_folder_path(lines[-1] if lines else "")
+        if chosen:
+            return chosen
+        if (proc.stderr or "").strip() and log_fn:
+            log_fn(f"pick_folder_dialog(legacy): {(proc.stderr or '').strip()}")
+    except Exception as ex:
+        if log_fn:
+            log_fn(f"pick_folder_dialog(legacy): {ex}")
+    return ""
+
+
 def _pick_folder_dialog_safe(title: str, initial: str = "", log_fn: Any = None) -> str:
     """
     Seletor de pasta fora da thread HTTP.
-    Tkinter dentro do ThreadingHTTPServer falha no Windows e devolve '' → "Selecao cancelada".
+    Windows: IFileOpenDialog (UI moderna). Fallback: Tkinter em subprocess.
     """
     from files_service import normalize_folder_path
 
@@ -146,40 +238,13 @@ def _pick_folder_dialog_safe(title: str, initial: str = "", log_fn: Any = None) 
     if sys.platform != "win32":
         return ""
 
-    init_ps = init.replace("'", "''")
-    title_ps = title_s.replace("'", "''")
-    ps = (
-        "Add-Type -AssemblyName System.Windows.Forms; "
-        "$d = New-Object System.Windows.Forms.FolderBrowserDialog; "
-        f"$d.Description = '{title_ps}'; "
-        "$d.ShowNewFolderButton = $true; "
-    )
-    if init_ps:
-        ps += f"if (Test-Path -LiteralPath '{init_ps}') {{ $d.SelectedPath = '{init_ps}' }}; "
-    ps += (
-        "$r = $d.ShowDialog(); "
-        "if ($r -eq [System.Windows.Forms.DialogResult]::OK) { Write-Output $d.SelectedPath }"
-    )
-    try:
-        flags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
-        proc = subprocess.run(
-            ["powershell", "-NoProfile", "-STA", "-Command", ps],
-            capture_output=True,
-            text=True,
-            timeout=600,
-            creationflags=flags,
-        )
-        lines = [ln.strip() for ln in (proc.stdout or "").splitlines() if ln.strip()]
-        chosen = normalize_folder_path(lines[-1] if lines else "")
-        if chosen:
-            return chosen
-        if proc.returncode != 0 and (proc.stderr or "").strip():
-            _log(f"pick_folder_dialog(ps): {(proc.stderr or '').strip()}")
-    except subprocess.TimeoutExpired:
-        _log("pick_folder_dialog: timeout")
-        return ""
-    except Exception as ex:
-        _log(f"pick_folder_dialog(ps): {ex}")
+    chosen = _pick_folder_dialog_win_modern(title_s, init, log_fn=_log)
+    if chosen:
+        return chosen
+
+    chosen = _pick_folder_dialog_win_legacy(title_s, init, log_fn=_log)
+    if chosen:
+        return chosen
 
     py = sys.executable
     if py.lower().endswith("python.exe"):
@@ -280,26 +345,54 @@ _SCHED_HELPERS = (
     "task_defaults:{Projeto:$('sm_projeto').value.trim(),Responsavel:$('sm_resp').value.trim(),"
     "Assunto:$('sm_assunto').value.trim(),Milestone:$('sm_milestone')?.value.trim()||'',"
     "Prioridade:$('sm_prio')?.value||'Média',Private:$('sm_private')?.checked?1:0}}}"
-    "function schedParseActions(){const raw=($('sm_actions')?.value||'').trim();if(!raw)return[];"
-    "let data;try{data=JSON.parse(raw)}catch(e){throw new Error('JSON invalido — '+e.message)}"
-    "if(!Array.isArray(data))throw new Error('Acoes default: tem de ser um array, ex. [{\"text\":\"Revisao\"}]');"
+    "function schedDefaultAction(){return{text:'Revisão',due_offset_days:0,owner:''}}"
+    "function schedReadActionsForm(){const rows=[...($('sm_actions_rows')?.querySelectorAll('tr')||[])];"
+    "return rows.map(tr=>{const text=String(tr.querySelector('.sm-act-text')?.value||'').trim();"
+    "const owner=String(tr.querySelector('.sm-act-owner')?.value||'').trim();"
+    "const off=parseInt(tr.querySelector('.sm-act-off')?.value||'0',10)||0;"
+    "const o={text,due_offset_days:off};if(owner)o.owner=owner;return o}).filter(a=>a.text)}"
+    "function schedSyncActionsJson(){const ta=$('sm_actions');if(ta){try{ta.value=JSON.stringify(schedReadActionsForm(),null,0)}catch(_){}}"
+    "schedValidateActionsJson()}"
+    "function schedAppendActionRow(a){const tb=$('sm_actions_rows');if(!tb)return;"
+    "const tr=document.createElement('tr');"
+    "tr.innerHTML='<td><input class=\"sm-act-text\" type=\"text\" placeholder=\"Texto da ação\" style=\"width:100%\"></td>'"
+    "+'<td><input class=\"sm-act-owner\" type=\"text\" placeholder=\"Owner\" style=\"width:100%\"></td>'"
+    "+'<td><input class=\"sm-act-off\" type=\"number\" value=\"0\" style=\"width:72px\"></td>'"
+    "+'<td><button type=\"button\" class=\"btn\" onclick=\"schedRemoveActionRow(this)\">✕</button></td>';"
+    "tr.querySelector('.sm-act-text').value=String(a?.text||a?.item_text||'');"
+    "tr.querySelector('.sm-act-owner').value=String(a?.owner||'');"
+    "tr.querySelector('.sm-act-off').value=String(Number(a?.due_offset_days||0));"
+    "tr.querySelectorAll('input').forEach(inp=>inp.addEventListener('input',schedSyncActionsJson));"
+    "tb.appendChild(tr)}"
+    "function schedLoadActionsForm(acts){const tb=$('sm_actions_rows');if(!tb)return;"
+    "const list=Array.isArray(acts)&&acts.length?acts:[schedDefaultAction()];tb.innerHTML='';"
+    "list.forEach(a=>schedAppendActionRow(a));schedSyncActionsJson()}"
+    "function schedAddActionRow(){schedAppendActionRow(schedDefaultAction());schedSyncActionsJson()}"
+    "function schedRemoveActionRow(btn){btn?.closest('tr')?.remove();"
+    "if(!$('sm_actions_rows')?.children?.length)schedAddActionRow();schedSyncActionsJson()}"
+    "function schedParseActions(){if($('sm_actions_rows')){const fromForm=schedReadActionsForm();"
+    "if($('sm_gda')?.checked||fromForm.length){for(let i=0;i<fromForm.length;i++){"
+    "if(!String(fromForm[i].text||'').trim())throw new Error('Ação #'+(i+1)+': falta o texto')}"
+    "return fromForm}return[]}"
+    "const raw=($('sm_actions')?.value||'').trim();if(!raw)return[];"
+    "let data;try{data=JSON.parse(raw)}catch(e){throw new Error('JSON inválido — '+e.message)}"
+    "if(!Array.isArray(data))throw new Error('Ações default: tem de ser um array');"
     "for(let i=0;i<data.length;i++){const it=data[i];"
-    "if(!it||typeof it!=='object')throw new Error('Acao #'+(i+1)+': cada entrada tem de ser um objeto');"
-    "if(!String(it.text||it.item_text||'').trim())throw new Error('Acao #'+(i+1)+': falta o campo \"text\"')}"
+    "if(!it||typeof it!=='object')throw new Error('Ação #'+(i+1)+': cada entrada tem de ser um objeto');"
+    "if(!String(it.text||it.item_text||'').trim())throw new Error('Ação #'+(i+1)+': falta o campo \"text\"')}"
     "return data}"
     "function schedValidateActionsJson(){const el=$('sm_actions_err'),ta=$('sm_actions');if(!el)return true;"
-    "if(!$('sm_gda')?.checked&&!($('sm_actions')?.value||'').trim()){el.style.display='none';el.textContent='';"
-    "ta?.classList.remove('invalid');return true}"
+    "if(!$('sm_gda')?.checked){el.style.display='none';el.textContent='';ta?.classList.remove('invalid');return true}"
     "try{schedParseActions();el.style.display='none';el.textContent='';ta?.classList.remove('invalid');return true}"
     "catch(e){el.textContent=e.message;el.style.display='block';ta?.classList.add('invalid');return false}}"
     "async function schedPreview(){try{const el=$('sm_preview');if(!el)return;el.textContent='A calcular...';"
     "let body=schedCollectBody();"
-    "if($('sm_gda')?.checked||($('sm_actions')?.value||'').trim()){"
-    "if(!schedValidateActionsJson()){el.innerHTML='<span style=\"color:var(--danger)\">Corrija o JSON das acoes.</span>';return}"
+    "if($('sm_gda')?.checked){"
+    "if(!schedValidateActionsJson()){el.innerHTML='<span style=\"color:var(--danger)\">Corrija as ações default.</span>';return}"
     "body.action_defaults=schedParseActions()}"
     "body.count=12;const j=await api('/api/scheduled/preview',{method:'POST',body:JSON.stringify(body)});"
     "if(j.errors&&j.errors.length){el.innerHTML='<span style=\"color:var(--danger)\">'+esc(j.errors.join(' | '))+'</span>';return}"
-    "if(!j.occurrences||!j.occurrences.length){el.textContent='Sem ocorrencias calculadas.';return}"
+    "if(!j.occurrences||!j.occurrences.length){el.textContent='Sem ocorrências calculadas.';return}"
     "el.innerHTML='<table style=\"width:100%;font-size:12px;border-collapse:collapse\">"
     "<thead><tr><th style=\"text-align:left;padding:2px 6px\">Data</th>"
     "<th style=\"text-align:left;padding:2px 6px\">Janela</th></tr></thead><tbody>'"
@@ -307,9 +400,9 @@ _SCHED_HELPERS = (
     "<td style=\"padding:2px 6px\">'+esc(o.window_label||o.window)+'</td></tr>').join('')+'</tbody></table>'"
     "}catch(e){$('sm_preview').innerHTML='<span style=\"color:var(--danger)\">'+esc(e.message)+'</span>'}}"
     "async function saveSchedModal(){try{if(!canEditTasks())return;"
-    "if(!schedValidateActionsJson()){toast($('sm_actions_err')?.textContent||'JSON de acoes invalido',true);return}"
+    "if(!schedValidateActionsJson()){toast($('sm_actions_err')?.textContent||'Ações default inválidas',true);return}"
     "let body=schedCollectBody();body.action_defaults=schedParseActions();"
-    "if(!body.name){toast('Nome obrigatorio',true);return}"
+    "if(!body.name){toast('Nome obrigatório',true);return}"
     "if(_schedEditId){await api('/api/scheduled/'+_schedEditId+'/update',{method:'POST',body:JSON.stringify(body)});"
     "toast('Guardado')}else{let j=await api('/api/scheduled/templates',{method:'POST',body:JSON.stringify(body)});"
     "toast('Criada #'+j.id)}unsavedClear();closeSchedModal();loadScheduled()}catch(e){toast(e.message,true)}}"
@@ -320,8 +413,9 @@ _SCHED_FILTERS_HTML = (
     '<b>🔎 Filtros</b>'
     '<div class="grid" style="margin-top:12px">'
     '<div class="field"><label>Pesquisar</label><input id="sch_f_q" placeholder="Nome, estado, tarefa..."></div>'
+    '<label style="padding-top:30px"><input type="checkbox" id="sch_f_active" checked> Só activas</label>'
     '<label style="padding-top:30px"><input type="checkbox" id="sch_f_pending"> Só pendentes</label>'
-    '<label style="padding-top:30px"><input type="checkbox" id="sch_f_active"> Só ativas</label>'
+    '<label style="padding-top:30px"><input type="checkbox" id="sch_f_failed"> Com falha</label>'
     '<div class="field"><label>Recorrência</label>'
     '<select id="sch_f_rec"><option value="Todos">Todos</option><option value="Semanal">Semanal</option>'
     '<option value="Mensal">Mensal</option><option value="Anual">Anual</option><option value="Uma vez">Uma vez</option>'
@@ -333,53 +427,252 @@ _SCHED_FILTERS_HTML = (
     "</div></section>"
 )
 
+_SCHED_TOOLBAR_HTML = (
+    '<div class="toolbar" id="sched-toolbar">'
+    '<button class="btn primary" id="sch_new" onclick="schedNew()">＋ Nova</button>'
+    '<button class="btn" id="sch_edit" onclick="schedEdit()" disabled>Editar</button>'
+    '<button class="btn" id="sch_gen" onclick="schedGenerate()" disabled title="Força a criação da tarefa do ciclo actual">Criar tarefa deste ciclo</button>'
+    '<button class="btn" id="sch_mat" onclick="schedMaterialize()" disabled title="Confirma um ciclo marcado como pendente (modo manual)">Confirmar pendente</button>'
+    '<button class="btn" id="sch_toggle" onclick="schedToggleSel()" disabled>Ativar/Desativar</button>'
+    '<button class="btn" id="sch_open_task" onclick="schedOpenTask()" disabled>Abrir tarefa</button>'
+    "</div>"
+    '<div id="sch_sel_detail" class="card sched-detail" style="display:none;padding:10px 14px;margin-bottom:8px">'
+    '<div class="muted" style="font-size:11px;margin-bottom:4px">Estado completo</div>'
+    '<div id="sch_sel_detail_text" style="font-size:13px;line-height:1.45"></div>'
+    "</div>"
+)
+
 _SCHED_FILTERS_JS = (
-    "const SCHED_FILTERS_KEY='webui.scheduled.filters.v1';"
-    "let _schedRowsAll=[];"
+    "let _schedRowsAll=[];let _schedFiltersLoaded=false;let _schedFiltersSaveTimer=null;"
     "function schedReadFilters(){return{"
     "q:($('sch_f_q')?.value||'').trim(),"
     "pending:!!$('sch_f_pending')?.checked,"
     "active:!!$('sch_f_active')?.checked,"
+    "failed:!!$('sch_f_failed')?.checked,"
     "rec:$('sch_f_rec')?.value||'Todos',"
     "mode:$('sch_f_mode')?.value||'Todos'}}"
-    "function schedSaveFilters(){try{localStorage.setItem(SCHED_FILTERS_KEY,JSON.stringify(schedReadFilters()))}catch(_){}}"
-    "function schedRestoreFilters(){try{const raw=localStorage.getItem(SCHED_FILTERS_KEY);if(!raw)return;"
-    "const o=JSON.parse(raw)||{};"
+    "function schedApplyDefaultFilters(){"
+    "if($('sch_f_active'))$('sch_f_active').checked=true;"
+    "if($('sch_f_pending'))$('sch_f_pending').checked=false;"
+    "if($('sch_f_failed'))$('sch_f_failed').checked=false}"
+    "function schedApplyFiltersObj(o){if(!o||typeof o!=='object')return;"
     "if($('sch_f_q'))$('sch_f_q').value=o.q||'';"
     "if($('sch_f_pending'))$('sch_f_pending').checked=!!o.pending;"
     "if($('sch_f_active'))$('sch_f_active').checked=!!o.active;"
+    "if($('sch_f_failed'))$('sch_f_failed').checked=!!o.failed;"
     "if($('sch_f_rec'))$('sch_f_rec').value=o.rec||'Todos';"
-    "if($('sch_f_mode'))$('sch_f_mode').value=o.mode||'Todos'}catch(_){}}"
+    "if($('sch_f_mode'))$('sch_f_mode').value=o.mode||'Todos'}"
+    "function schedSaveFilters(){try{clearTimeout(_schedFiltersSaveTimer);"
+    "_schedFiltersSaveTimer=setTimeout(async()=>{try{await api('/api/scheduled/prefs',{method:'POST',body:JSON.stringify(schedReadFilters())})}catch(_){}},280)}catch(_){}}"
+    "async function schedRestoreFilters(){try{"
+    "let j=await api('/api/scheduled/prefs');const o=(j&&j.prefs)||{};"
+    "if(o&&typeof o==='object'&&Object.keys(o).length){schedApplyFiltersObj(o);_schedFiltersLoaded=true;return}"
+    "schedApplyDefaultFilters();_schedFiltersLoaded=true}catch(_){schedApplyDefaultFilters();_schedFiltersLoaded=true}}"
+    "function schedRecMatches(r,rec){if(rec==='Todos')return true;"
+    "return String(r.recurrence_human||'').trim().startsWith(rec)}"
     "function schedApplyFilters(rows){const f=schedReadFilters();const q=f.q.toLowerCase();"
     "return (rows||[]).filter(r=>{"
-    "if(f.pending&&!String(r.pending_human||'').trim())return false;"
+    "if(f.pending&&String(r.pending_human||'')!=='Sim')return false;"
     "if(f.active&&(r.is_active===false||r.is_active===0))return false;"
-    "if(f.rec!=='Todos'&&String(r.recurrence_human||'')!==f.rec)return false;"
+    "if(f.failed&&!r.is_failed&&!String(r.state_human||'').startsWith('Falhou'))return false;"
+    "if(!schedRecMatches(r,f.rec))return false;"
     "if(f.mode!=='Todos'&&String(r.mode_human||'')!==f.mode)return false;"
-    "if(q){const blob=[r.name,r.state_human,r.last_task_id,r.visibility_human,r.pending_human].map(v=>String(v||'')).join(' ').toLowerCase();"
+    "if(q){const blob=[r.name,r.state_human,r.state_short,r.last_task_id,r.visibility_human,r.pending_human].map(v=>String(v||'')).join(' ').toLowerCase();"
     "if(!blob.includes(q))return false}"
     "return true})}"
+    "function schedStateBadge(r){const s=String(r?.state_short||r?.state_human||'').trim();"
+    "let cls='sched-st-norm';if(!int(r?.is_active))cls='sched-st-off';"
+    "else if(r?.is_failed||s.startsWith('Falhou'))cls='sched-st-fail';"
+    "else if(String(r?.pending_human||'')==='Sim'||s.startsWith('Pendente'))cls='sched-st-pend';"
+    "else if(s.startsWith('Atrasada'))cls='sched-st-late';"
+    "else if(s.startsWith('Aguarda'))cls='sched-st-wait';"
+    "else if(s.startsWith('Conclu'))cls='sched-st-done';"
+    "return '<span class=\"sched-st '+cls+'\" title=\"'+esc(r?.state_human||s)+'\">'+esc(s||'—')+'</span>'}"
+    "function int(v){return v!==false&&v!==0&&v!=='0'}"
+    "function schedUpdateDetail(){const box=$('sch_sel_detail'),el=$('sch_sel_detail_text');if(!box||!el)return;"
+    "const r=_schedRows.find(x=>x.id===_schedSel);if(!r){box.style.display='none';return}"
+    "box.style.display='block';el.textContent=String(r.state_human||'—')}"
+    "function schedFilterFailed(){if($('sch_f_failed'))$('sch_f_failed').checked=true;"
+    "if($('sch_f_pending'))$('sch_f_pending').checked=false;schedSaveFilters();schedRefilter()}"
+    "function schedOpenPending(){window._sched_open_pending=true;showPage('scheduled')}"
     "function schedRefilter(){_schedRows=schedApplyFilters(_schedRowsAll);"
     "if(!_schedRows.some(x=>x.id===_schedSel))_schedSel=null;renderScheduled()}"
     "function schedBindFilters(){if(window._schedFiltersBound)return;window._schedFiltersBound=true;"
-    "['sch_f_q','sch_f_pending','sch_f_active','sch_f_rec','sch_f_mode'].forEach(id=>{const el=$(id);if(!el)return;"
+    "['sch_f_q','sch_f_pending','sch_f_active','sch_f_failed','sch_f_rec','sch_f_mode'].forEach(id=>{const el=$(id);if(!el)return;"
     "const evt=id==='sch_f_q'?'input':'change';el.addEventListener(evt,()=>{schedSaveFilters();schedRefilter()})})}"
     "function schedClearFilters(){if($('sch_f_q'))$('sch_f_q').value='';"
-    "if($('sch_f_pending'))$('sch_f_pending').checked=false;if($('sch_f_active'))$('sch_f_active').checked=false;"
+    "if($('sch_f_pending'))$('sch_f_pending').checked=false;"
+    "if($('sch_f_active'))$('sch_f_active').checked=true;"
+    "if($('sch_f_failed'))$('sch_f_failed').checked=false;"
     "if($('sch_f_rec'))$('sch_f_rec').value='Todos';if($('sch_f_mode'))$('sch_f_mode').value='Todos';"
     "schedSaveFilters();schedRefilter()}"
 )
 
+_SCHED_RENDER_JS = (
+    "function renderScheduled(){const tb=$('sch_rows');if(!tb)return;tb.innerHTML='';"
+    "_schedRows.forEach(r=>{const tr=document.createElement('tr');if(_schedSel===r.id)tr.className='sel';"
+    "tr.onclick=()=>{_schedSel=r.id;renderScheduled()};"
+    "tr.innerHTML=`<td><b>${esc(r.name||'')}</b></td><td>${esc(r.recurrence_human||'')}</td>"
+    "<td>${esc((r.next_run_date||'').slice(0,10))}</td><td>${schedStateBadge(r)}</td>"
+    "<td>${esc(r.mode_human||'')}</td><td>${esc(r.visibility_human||'')}</td>"
+    "<td>${esc(r.pending_human||'')}</td><td>${esc(r.last_task_id||'—')}</td>`;tb.appendChild(tr)});"
+    "const r=_schedRows.find(x=>x.id===_schedSel);const ce=canEditTasks()&&r&&r.can_edit;"
+    "['sch_edit','sch_gen','sch_toggle'].forEach(id=>{const el=$(id);if(el)el.disabled=!ce});"
+    "if($('sch_mat'))$('sch_mat').disabled=!ce||String(r?.pending_human||'')!=='Sim';"
+    "if($('sch_open_task'))$('sch_open_task').disabled=!r||!r.last_task_id;"
+    "if($('sch_new'))$('sch_new').style.display=canEditTasks()?'inline-block':'none';"
+    "schedUpdateDetail()}"
+)
+
 _SCHED_LOGS_HTML = (
-    '<section class="card" id="sched-logs" style="margin-top:12px;padding:12px">'
-    '<div style="display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap">'
-    '<b>📜 Últimas operações</b>'
-    '<div>'
+    '<details class="card" id="sched-logs" style="margin-top:12px;padding:12px">'
+    '<summary style="cursor:pointer;font-weight:600">📜 Últimas operações (técnico)</summary>'
+    '<div style="display:flex;justify-content:flex-end;gap:8px;margin:10px 0 6px">'
     '<button class="btn" type="button" onclick="loadScheduledLogs()">Atualizar</button>'
     '<button class="btn" type="button" onclick="clearScheduledLogs()">Limpar</button>'
+    "</div>"
+    '<pre id="sch_logs" class="muted" style="max-height:170px;overflow:auto;white-space:pre-wrap">Sem operações.</pre>'
+    "</details>"
+)
+
+_SCHED_CSS = (
+    "#page-scheduled .sched-st{display:inline-block;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600;max-width:160px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;vertical-align:middle}"
+    "#page-scheduled .sched-st-off{background:#f1f5f9;color:#64748b}"
+    "#page-scheduled .sched-st-fail{background:#fee2e2;color:#991b1b}"
+    "#page-scheduled .sched-st-pend{background:#fef3c7;color:#92400e}"
+    "#page-scheduled .sched-st-late{background:#ffedd5;color:#9a3412}"
+    "#page-scheduled .sched-st-wait{background:#e0f2fe;color:#075985}"
+    "#page-scheduled .sched-st-done{background:#dcfce7;color:#166534}"
+    "#page-scheduled .sched-st-norm{background:#eef2ff;color:#3730a3}"
+    "#page-scheduled .sched-detail{border-color:#dbeafe;background:#f8fbff}"
+    "#page-scheduled details#sched-logs summary{list-style:none}"
+    "#page-scheduled details#sched-logs summary::-webkit-details-marker{display:none}"
+    "#sched-modal.modal-bg{align-items:flex-start;padding:24px 16px;backdrop-filter:blur(2px)}"
+    "#sched-modal .sched-modal{width:min(920px,96vw);max-height:calc(100vh - 48px);display:flex;flex-direction:column;overflow:hidden}"
+    "#sched-modal .mh{display:flex;align-items:flex-start;justify-content:space-between;gap:12px;padding:18px 22px;border-bottom:1px solid var(--border)}"
+    "#sched-modal .sched-mh-title b{display:block;font-size:18px;line-height:1.25}"
+    "#sched-modal .sched-modal-sub{font-size:12px;margin-top:4px}"
+    "#sched-modal .mb{flex:1;overflow:auto;padding:18px 22px 22px}"
+    "#sched-modal .sched-mf{display:flex;align-items:center;justify-content:space-between;gap:10px;border-top:1px solid var(--border);border-bottom:0;padding:14px 22px}"
+    "#sched-modal .sched-mf-right{display:flex;gap:8px;flex-wrap:wrap;justify-content:flex-end}"
+    "#sched-modal .sm-wd-grid{display:flex;flex-wrap:wrap;gap:8px;margin-top:4px}"
+    "#sched-modal .sm-wd-pill{display:inline-flex;cursor:pointer;user-select:none}"
+    "#sched-modal .sm-wd-pill input{position:absolute;opacity:0;width:0;height:0}"
+    "#sched-modal .sm-wd-pill span{display:inline-block;padding:7px 12px;border:1px solid #d7dde8;border-radius:999px;background:#fff;font-size:12px;font-weight:600;color:#475569;transition:all .15s ease}"
+    "#sched-modal .sm-wd-pill input:checked+span{background:#0869d8;border-color:#0869d8;color:#fff;box-shadow:0 1px 2px rgba(8,105,216,.25)}"
+    "#sched-modal .sm-wd-pill input:focus-visible+span{outline:2px solid #93c5fd;outline-offset:2px}"
+    "#sched-modal .sched-preview{border:1px solid #e2e8f0;border-radius:10px;background:#f8fafc;padding:10px 12px;min-height:52px;font-size:12px;line-height:1.45;max-height:180px;overflow:auto}"
+    "#sched-modal .sched-actions-box{margin-top:10px;padding:12px;border:1px solid #e2e8f0;border-radius:12px;background:#fafbfc}"
+    "#sched-modal .sm-check-row{display:flex;align-items:center;gap:8px;font-size:13px;color:#374151;margin-bottom:8px}"
+    "#sched-modal .sm-json-adv{margin-top:10px;font-size:12px}"
+    "#sched-modal .sm-json-adv summary{cursor:pointer;color:#64748b;padding:4px 0}"
+    "#sched-modal .sm-json-adv textarea{margin-top:6px;font-family:Consolas,monospace;font-size:11px}"
+    "#sched-modal #sm_actions_rows input{padding:8px 10px;border:1px solid #d7dde8;border-radius:8px;font-size:12px;width:100%}"
+    "#sched-modal #sm_actions_box table{width:100%;border-collapse:collapse;font-size:12px}"
+    "#sched-modal #sm_actions_box th,#sched-modal #sm_actions_box td{padding:6px 8px;text-align:left;vertical-align:middle}"
+    "#sched-modal #sm_actions_box th{font-size:11px;color:#64748b;font-weight:700;text-transform:uppercase;letter-spacing:.02em}"
+    "@media(max-width:900px){#sched-modal .sched-modal{width:min(98vw,98vw)}#sched-modal .form{grid-template-columns:repeat(2,1fr)!important}}"
+    "@media(max-width:640px){#sched-modal .form{grid-template-columns:1fr!important}#sched-modal .sched-mf{flex-direction:column;align-items:stretch}#sched-modal .sched-mf-right{justify-content:stretch}#sched-modal .sched-mf-right .btn{flex:1}}"
+)
+
+_SCHED_MODAL_HTML = (
+    '<div class="modal-bg" id="sched-modal" style="display:none">'
+    '<div class="modal sched-modal">'
+    '<div class="mh">'
+    '<div class="sched-mh-title"><b id="sched-modal-title">Programada</b>'
+    '<div class="muted sched-modal-sub" id="sched-modal-sub">Template de recorrência</div></div>'
+    '<button class="btn" type="button" onclick="closeSchedModal()" aria-label="Fechar">✕</button>'
+    "</div>"
+    '<div class="mb">'
+    '<div class="tabs" id="sm_tabs">'
+    '<button type="button" class="on" data-tab="rec" onclick="schedTab(\'rec\')">Recorrência</button>'
+    '<button type="button" data-tab="task" onclick="schedTab(\'task\')">Tarefa gerada</button>'
+    '<button type="button" data-tab="actions" onclick="schedTab(\'actions\')">Ações default</button>'
+    "</div>"
+    '<div id="sm_panel_rec" class="form">'
+    '<div class="field span4"><label>Nome *</label>'
+    '<input id="sm_name" type="text" placeholder="Ex.: Revisão semanal de KPIs"></div>'
+    '<div class="field"><label>Recorrência</label>'
+    '<select id="sm_rec" onchange="schedRecUI()">'
+    '<option value="weekly">Semanal</option><option value="monthly">Mensal</option>'
+    '<option value="yearly">Anual</option><option value="once">Uma vez</option>'
+    "</select></div>"
+    '<div class="field"><label>Intervalo</label><input id="sm_int" type="number" min="1" value="1"></div>'
+    '<div class="field"><label>Próxima data</label><input id="sm_next" type="date"></div>'
+    '<div class="field span4" id="sm_weekly_row" style="display:none"><label>Dias da semana</label>'
+    '<div class="sm-wd-grid">'
+    '<label class="sm-wd-pill"><input type="checkbox" id="sm_wd0"><span>Seg</span></label>'
+    '<label class="sm-wd-pill"><input type="checkbox" id="sm_wd1"><span>Ter</span></label>'
+    '<label class="sm-wd-pill"><input type="checkbox" id="sm_wd2"><span>Qua</span></label>'
+    '<label class="sm-wd-pill"><input type="checkbox" id="sm_wd3"><span>Qui</span></label>'
+    '<label class="sm-wd-pill"><input type="checkbox" id="sm_wd4"><span>Sex</span></label>'
+    '<label class="sm-wd-pill"><input type="checkbox" id="sm_wd5"><span>Sáb</span></label>'
+    '<label class="sm-wd-pill"><input type="checkbox" id="sm_wd6"><span>Dom</span></label>'
     "</div></div>"
-    '<pre id="sch_logs" class="muted" style="margin-top:10px;max-height:170px;overflow:auto;white-space:pre-wrap">Sem operações.</pre>'
-    "</section>"
+    '<div class="field" id="sm_dom_row" style="display:none"><label>Dia do mês</label>'
+    '<input id="sm_dom" type="number" min="1" max="31"></div>'
+    '<div class="field" id="sm_moy_row" style="display:none"><label>Mês (1–12)</label>'
+    '<input id="sm_moy" type="number" min="1" max="12"></div>'
+    '<div class="field" id="sm_once_row" style="display:none"><label>Data única</label>'
+    '<input id="sm_once" type="date"></div>'
+    '<div class="field"><label>Modo</label><select id="sm_mode">'
+    '<option value="MANUAL">Manual</option><option value="AUTO">Automática</option>'
+    "</select></div>"
+    '<div class="field"><label>Visibilidade</label><select id="sm_vis">'
+    '<option value="PERSONAL">Pessoal</option><option value="SHARED">Partilhada</option>'
+    "</select></div>"
+    '<div class="field"><label>Lead (dias)</label><input id="sm_lead" type="number" min="0" value="0"></div>'
+    '<div class="field"><label>Grace (dias)</label><input id="sm_grace" type="number" min="0" value="30"></div>'
+    '<div class="field"><label>Ativa</label><select id="sm_active">'
+    '<option value="1">Sim</option><option value="0">Não</option>'
+    "</select></div>"
+    '<div class="field span4"><label>Pré-visualização</label>'
+    '<div id="sm_preview" class="sched-preview muted">Configure a recorrência e use «Pré-visualizar».</div>'
+    "</div></div>"
+    '<div id="sm_panel_task" class="form" style="display:none">'
+    '<div class="field"><label>Projeto</label><input id="sm_projeto" type="text"></div>'
+    '<div class="field"><label>Responsável</label><input id="sm_resp" type="text"></div>'
+    '<div class="field span2"><label>Assunto</label><input id="sm_assunto" type="text"></div>'
+    '<div class="field"><label>Milestone</label><input id="sm_milestone" type="text"></div>'
+    '<div class="field"><label>Prioridade</label><select id="sm_prio">'
+    '<option value="">(default)</option><option>Baixa</option>'
+    '<option selected>Média</option><option>Alta</option>'
+    "</select></div>"
+    '<div class="field span4"><label class="sm-check-row" style="margin:0">'
+    '<input type="checkbox" id="sm_private"> Tarefa privada</label></div>'
+    "</div>"
+    '<div id="sm_panel_actions" style="display:none">'
+    '<label class="sm-check-row"><input type="checkbox" id="sm_gda" onchange="schedValidateActionsJson()"> '
+    "Gerar ações default na tarefa criada</label>"
+    '<div id="sm_actions_box" class="sched-actions-box">'
+    '<div class="toolbar" style="margin:0 0 8px">'
+    '<button type="button" class="btn primary" onclick="schedAddActionRow()">＋ Ação</button>'
+    "</div>"
+    '<div class="act-wrap table-wrap"><table><thead><tr>'
+    "<th>Texto</th><th>Owner</th><th>Offset (dias)</th><th></th>"
+    "</tr></thead><tbody id=\"sm_actions_rows\"></tbody></table></div>"
+    '<details class="sm-json-adv"><summary>JSON avançado</summary>'
+    '<textarea id="sm_actions" rows="2" onblur="schedSyncActionsJson()">[]</textarea>'
+    "</details></div>"
+    '<div id="sm_actions_err" style="color:var(--danger);display:none;font-size:12px;margin-top:8px"></div>'
+    "</div></div>"
+    '<div class="mf sched-mf">'
+    '<button class="btn" type="button" onclick="schedPreview()">Pré-visualizar</button>'
+    '<div class="sched-mf-right">'
+    '<button class="btn" type="button" onclick="closeSchedModal()">Cancelar</button>'
+    '<button class="btn primary" type="button" onclick="saveSchedModal()">Guardar</button>'
+    "</div></div></div></div>"
+)
+
+_SCHED_MODAL_JS = (
+    "function schedTab(id){const tabs=['rec','task','actions'];"
+    "tabs.forEach(t=>{const p=$('sm_panel_'+t);if(!p)return;"
+    "if(t===id){p.style.display=(t==='actions')?'block':'grid'}else p.style.display='none'});"
+    "document.querySelectorAll('#sm_tabs [data-tab]').forEach(b=>b.classList.toggle('on',b.dataset.tab===id))}"
+    "function schedRecUI(){const r=$('sm_rec')?.value||'monthly';"
+    "const show=(id,on)=>{const el=$(id);if(el)el.style.display=on?'':'none'};"
+    "show('sm_weekly_row',r==='weekly');show('sm_dom_row',r==='monthly'||r==='yearly');"
+    "show('sm_moy_row',r==='yearly');show('sm_once_row',r==='once')}"
 )
 
 _SCHED_LOGS_JS = (
@@ -603,7 +896,11 @@ def _patch_html(html: str) -> str:
                             _patch_html_diagnostics(
                                 _patch_html_task_detail(
                                     _patch_html_achievements(
-                                        _patch_html_scheduled(_patch_html_my_day(_patch_html_notes(_patch_html_tasks(html))))
+                                        _patch_html_board(
+                                            _patch_html_scheduled(
+                                                _patch_html_my_day(_patch_html_notes(_patch_html_tasks(html)))
+                                            )
+                                        )
                                     )
                                 )
                             )
@@ -702,6 +999,7 @@ _MY_DAY_PAGE = (
     '<button class="btn" onclick="showPage(\'dashboard\')">Abrir dashboard</button>'
     '<button class="btn" onclick="showPage(\'ach\')">Abrir conquistas</button>'
     '<button class="btn" onclick="showPage(\'board\')">Abrir board</button>'
+    '<button class="btn" onclick="schedOpenPending()">Programadas pendentes</button>'
     '<button class="btn" onclick="loadMyDay()">Atualizar estado</button>'
     "</div></section></div>"
 )
@@ -1079,7 +1377,7 @@ _HOME_KPIS_SECTION = (
     '<div class="ico">🏆</div><div><div class="muted">Conquistas</div><div class="v" id="hk_ach">0</div></div></div>'
     '<div class="kpi"><div class="ico">✅</div><div><div class="muted">Validadas</div><div class="v" id="hk_valid">0</div></div></div>'
     '<div class="kpi"><div class="ico">📈</div><div><div class="muted">Impacto €</div><div class="v" id="hk_impact">€0</div></div></div>'
-    '<div class="kpi kpi-click" onclick="showPage(\'scheduled\')" title="Programadas pendentes">'
+    '<div class="kpi kpi-click" onclick="schedOpenPending()" title="Programadas pendentes">'
     '<div class="ico">📅</div><div><div class="muted">Prog. pendentes</div><div class="v" id="hk_sched">0</div></div></div>'
     "</section>"
 )
@@ -1149,7 +1447,8 @@ _TASK_COL_PREFS_JS = (
     "Notificacoes:'Notificações',NotifEmoji:'Notif.',Prazo:'Prazo',Projeto:'Projeto',Linha:'Linha',Maquina:'Máquina',Pasta:'Pasta',"
     "ResultadoInicial:'Resultado inicial',ResultadoFinal:'Resultado final',Links:'Links'};"
     "const _TASK_COL_DEFAULT=['TaskID','Tarefa','NotifEmoji','Notificacoes','Milestone','Assunto','DataRegisto','Prazo','Responsavel','Workers','Estado','Prioridade'];"
-    "let _taskColsAll=[..._TASK_COL_DEFAULT],_taskColsVisible=[..._TASK_COL_DEFAULT],_taskColsReady=false;"
+    "let _taskColsAll=[..._TASK_COL_DEFAULT],_taskColsVisible=[..._TASK_COL_DEFAULT],_taskColsReady=false,_taskColWidths={},_taskColResize=null,_taskColSaveTimer=null,_taskColMeasureEl=null;"
+    "const _TASK_COL_FLEX=new Set(['Tarefa','Assunto','DescricaoNotas','Milestone','Workers','Notificacoes','Projeto','Linha','Pasta','Links','ResultadoInicial','ResultadoFinal']);"
     "function _taskColLabel(c){return _TASK_COL_LABELS[c]||String(c||'')}"
     "function _taskColsNormalize(cols){const base=Array.isArray(_taskColsAll)&&_taskColsAll.length?_taskColsAll:_TASK_COL_DEFAULT;"
     "const out=[];(Array.isArray(cols)?cols:[]).forEach(c=>{const k=String(c||'').trim();if(k&&base.includes(k)&&!out.includes(k))out.push(k)});"
@@ -1159,21 +1458,20 @@ _TASK_COL_PREFS_JS = (
     "if($('ef_col'))$('ef_col').value=String(c||'');if(typeof syncExcelDatePanel==='function')syncExcelDatePanel();"
     "if(typeof loadExcelFilterValues==='function')await loadExcelFilterValues()}catch(e){toast(e.message,true)}}"
     "function taskColsRenderHeader(){const tb=$('trows');if(!tb)return;const table=tb.closest('table');const tr=table?.querySelector('thead tr');if(!tr)return;"
-    "const cols=_taskColsNormalize(_taskColsVisible);tr.innerHTML=cols.map(c=>_taskColSortable(c)?"
-    "`<th class=\"sortable\" onclick=\"sortTasks('${c}')\">${esc(_taskColLabel(c))}<span class=\"th-filter-arrow\" onclick=\"taskColQuickFilter('${c}',event)\" title=\"Filtrar coluna\">▾</span></th>`"
-    ":`<th>${esc(_taskColLabel(c))}<span class=\"th-filter-arrow\" onclick=\"taskColQuickFilter('${c}',event)\" title=\"Filtrar coluna\">▾</span></th>`).join('')}"
+    "const cols=_taskColsNormalize(_taskColsVisible);tr.innerHTML=cols.map(c=>_taskColThHtml(c)).join('');_taskColsApplyLayout()}"
     "async function taskColsEnsureLoaded(){if(_taskColsReady){taskColsRenderHeader();return}"
     "try{let j=await api('/api/tasks/columns/prefs');const all=Array.isArray(j.available_columns)&&j.available_columns.length?j.available_columns:_TASK_COL_DEFAULT;"
-    "_taskColsAll=[...new Set(all.map(x=>String(x||'').trim()).filter(x=>x))];_taskColsVisible=_taskColsNormalize(j.columns)}"
+    "_taskColsAll=[...new Set(all.map(x=>String(x||'').trim()).filter(x=>x))];_taskColsVisible=_taskColsNormalize(j.columns);"
+    "_taskColWidths=_taskColNormalizeWidths(j.widths,_taskColsVisible)}"
     "catch(_){_taskColsAll=[..._TASK_COL_DEFAULT];_taskColsVisible=[..._TASK_COL_DEFAULT]}"
     "_taskColsReady=true;taskColsRenderHeader()}"
     "function _taskDate(v){return esc(String(v||'').slice(0,10))}"
-    "function _taskColCell(r,c){if(c==='TaskID'){const prv=(r&&((r.Private??r.private)))||0;const priv=n0(prv)?'🔒 ':'';return `<td title=\"${esc(r.TaskID)}\">${priv}${esc(fmtTid(r.TaskID))}</td>`}"
-    "if(c==='Tarefa')return `<td><b>${esc(r.Tarefa||'')}</b></td>`;"
-    "if(c==='Estado')return `<td class=\"status-cell\" title=\"Clique para mudar estado\">${teBadge(r.Estado)}</td>`;"
-    "if(c==='Prioridade')return `<td>${tpBadge(r.Prioridade)}</td>`;"
-    "if(c==='DataRegisto'||c==='Prazo'||c==='InicioPrevisto')return `<td>${_taskDate(r[c])}</td>`;"
-    "return `<td>${esc((r&&r[c]!=null)?r[c]:'')}</td>`}"
+    "function _taskColCell(r,c){if(c==='TaskID'){const prv=(r&&((r.Private??r.private)))||0;const priv=n0(prv)?'🔒 ':'';return `<td data-col=\"${c}\" title=\"${esc(r.TaskID)}\">${priv}${esc(fmtTid(r.TaskID))}</td>`}"
+    "if(c==='Tarefa')return `<td data-col=\"${c}\"><b>${esc(r.Tarefa||'')}</b></td>`;"
+    "if(c==='Estado')return `<td data-col=\"${c}\" class=\"status-cell\" title=\"Clique para mudar estado\">${teBadge(r.Estado)}</td>`;"
+    "if(c==='Prioridade')return `<td data-col=\"${c}\">${tpBadge(r.Prioridade)}</td>`;"
+    "if(c==='DataRegisto'||c==='Prazo'||c==='InicioPrevisto')return `<td data-col=\"${c}\">${_taskDate(r[c])}</td>`;"
+    "return `<td data-col=\"${c}\">${esc((r&&r[c]!=null)?r[c]:'')}</td>`}"
     "function _taskColsEnsureModal(){if($('task-cols-modal'))return;"
     "document.body.insertAdjacentHTML('beforeend','<div class=\"modal-bg\" id=\"task-cols-modal\" style=\"display:none\">"
     "<div class=\"modal\" style=\"width:min(880px,94vw)\"><div class=\"mh\"><h3>Personalizar colunas (SQL)</h3>"
@@ -1204,21 +1502,104 @@ _TASK_COL_PREFS_JS = (
     "function taskColsResetDefault(){const vis=$('tc_vis'),hid=$('tc_hid');if(!vis||!hid)return;const d=_taskColsNormalize(_TASK_COL_DEFAULT);"
     "vis.innerHTML=d.map(_tcOpt).join('');hid.innerHTML=(_taskColsAll||[]).filter(c=>!d.includes(c)).map(_tcOpt).join('')}"
     "async function saveTaskColsModal(){const cols=_tcRead('tc_vis');if(!cols.length){toast('Tem de manter pelo menos uma coluna visível',true);return}"
-    "try{await api('/api/tasks/columns/prefs',{method:'POST',body:JSON.stringify({columns:cols})});_taskColsVisible=_taskColsNormalize(cols);"
+    "try{await api('/api/tasks/columns/prefs',{method:'POST',body:JSON.stringify({columns:cols,widths:_taskColWidths})});_taskColsVisible=_taskColsNormalize(cols);"
     "closeTaskColsModal();renderTasks();toast('Colunas guardadas (SQL)')}catch(e){toast(e.message,true)}}"
     "function _renderTasksBySqlCols(){const canEdit=(typeof canEditTasks==='function')?canEditTasks():(String(user?.role||'').trim().toLowerCase()==='edit'||String(user?.role||'').trim().toLowerCase()==='admin');taskColsRenderHeader();"
     "let tb=$('trows');if(!tb)return;tb.innerHTML='';const cols=_taskColsNormalize(_taskColsVisible);"
-    "taskRows.forEach(r=>{let tr=document.createElement('tr');if(taskSel===r.TaskID)tr.className='sel';if(r.is_overdue)tr.classList.add('row-overdue');"
+    "const _pageRows=(typeof tasksPagerSlice==='function')?tasksPagerSlice(taskRows):taskRows;"
+    "_pageRows.forEach(r=>{let tr=document.createElement('tr');const _acc=(typeof _taskRowAccent==='function')?_taskRowAccent(r):'';"
+    "if(taskSel===r.TaskID)tr.className='sel';if(_acc)tr.classList.add(_acc);if(r.is_overdue)tr.classList.add('row-overdue');"
     "if((r.blocked_count||0)>0)tr.classList.add('row-blocked');if(r.is_recent)tr.classList.add('row-recent');"
     "tr.onclick=()=>{taskSel=r.TaskID;renderTasks()};tr.ondblclick=()=>openTaskDetail(r.TaskID);"
     "tr.innerHTML=cols.map(c=>_taskColCell(r,c)).join('');const stCell=tr.querySelector('.status-cell');"
     "if(stCell&&canEdit)stCell.onclick=(e)=>{e.stopPropagation();quickSetStatus(r.TaskID,r.Estado)};tb.appendChild(tr)});"
+    "if(typeof tasksUpdatePager==='function')tasksUpdatePager();"
     "const has=!!taskSel;if($('tb_edit'))$('tb_edit').disabled=!has||!canEdit;if($('tb_dup'))$('tb_dup').disabled=!has||!canEdit;"
-    "if($('tb_del'))$('tb_del').disabled=!has||!canEdit;if($('tb_folder'))$('tb_folder').disabled=!has;if($('tb_link'))$('tb_link').disabled=!has}"
+    "if($('tb_del'))$('tb_del').disabled=!has||!canEdit;if($('tb_folder'))$('tb_folder').disabled=!has;if($('tb_link'))$('tb_link').disabled=!has;"
+    "_taskColsApplyLayout();if(!_taskColHasSavedWidths())_taskColsAutoFit('auto')}"
+)
+
+_TASK_COL_WIDTH_JS = (
+    "function _taskColMinWidth(c){const m={TaskID:72,NotifEmoji:44,Tarefa:96,Estado:84,Prioridade:68,DataRegisto:84,Prazo:84,InicioPrevisto:84};return m[c]||72}"
+    "function _taskColMaxWidth(c){const m={TaskID:180,NotifEmoji:70,Tarefa:640,Estado:180,Prioridade:140,Notificacoes:420};return m[c]||420}"
+    "function _taskColNormalizeWidths(raw,cols){const out={};const vis=_taskColsNormalize(cols);"
+    "if(raw&&typeof raw==='object'){vis.forEach(c=>{const w=parseInt(raw[c],10);if(w>=40&&w<=900)out[c]=w})}return out}"
+    "function _taskColHasSavedWidths(){return _taskColsNormalize(_taskColsVisible).some(c=>Number(_taskColWidths[c]||0)>0)}"
+    "function _taskColMeasure(text,bold){if(!_taskColMeasureEl){_taskColMeasureEl=document.createElement('span');"
+    "_taskColMeasureEl.style.cssText='position:fixed;left:-9999px;top:0;visibility:hidden;white-space:nowrap;font:13px/1.25 Segoe UI,system-ui,sans-serif;padding:0 8px'}"
+    "_taskColMeasureEl.style.fontWeight=bold?'700':'400';_taskColMeasureEl.textContent=String(text||'').slice(0,160);"
+    "document.body.appendChild(_taskColMeasureEl);const w=_taskColMeasureEl.offsetWidth+22;document.body.removeChild(_taskColMeasureEl);return w}"
+    "function _taskColCellText(r,c){if(!r)return '';if(c==='TaskID')return String(fmtTid(r.TaskID)||r.TaskID||'');"
+    "if(c==='Estado')return String(r.Estado||'Não iniciado');if(c==='Prioridade')return String(r.Prioridade||'');"
+    "const v=r[c];return v==null?'':String(v)}"
+    "function _taskColThHtml(c){const w=Number(_taskColWidths[c]||0);const ws=w>0?` style=\"width:${w}px;min-width:${w}px;max-width:${w}px\"`:'';"
+    "const sort=_taskColSortable(c)?' sortable':'';const click=_taskColSortable(c)?` onclick=\"sortTasks('${c}')\"`:'';"
+    "return `<th class=\"task-col-th${sort}\" data-col=\"${c}\"${ws}${click}>${esc(_taskColLabel(c))}`"
+    "+`<span class=\"th-filter-arrow\" onclick=\"taskColQuickFilter('${c}',event)\" title=\"Filtrar coluna\">▾</span>`"
+    "+`<span class=\"col-resizer\" onmousedown=\"taskColStartResize(event,'${c}')\" title=\"Ajustar largura\"></span></th>`}"
+    "function _taskColsApplyLayout(){const tb=$('trows');if(!tb)return;const table=tb.closest('table');if(!table)return;"
+    "const cols=_taskColsNormalize(_taskColsVisible);let cg=table.querySelector('colgroup#task-cols-cg');"
+    "if(!cg){cg=document.createElement('colgroup');cg.id='task-cols-cg';const thead=table.querySelector('thead');if(thead)table.insertBefore(cg,thead);else table.insertBefore(cg,table.firstChild)}"
+    "cg.innerHTML=cols.map(c=>{const w=Number(_taskColWidths[c]||0);return w>0?`<col data-col=\"${c}\" style=\"width:${w}px\">`: `<col data-col=\"${c}\">`}).join('');"
+    "const tr=table.querySelector('thead tr');if(tr){Array.from(tr.children).forEach((th,i)=>{const c=cols[i];if(!c)return;const w=Number(_taskColWidths[c]||0);"
+    "if(w>0){th.style.width=w+'px';th.style.minWidth=w+'px';th.style.maxWidth=w+'px'}else{th.style.width='';th.style.minWidth='';th.style.maxWidth=''}})}}"
+    "function _taskColsAutoFit(mode){const cols=_taskColsNormalize(_taskColsVisible);if(!cols.length)return;"
+    "const rows=(taskRows||[]).slice(0,250);const next={};cols.forEach(c=>{let max=_taskColMeasure(_taskColLabel(c),true);"
+    "rows.forEach(r=>{const t=_taskColCellText(r,c);if(!t) return;const bold=(c==='Tarefa');max=Math.max(max,_taskColMeasure(t,bold))});"
+    "next[c]=Math.max(_taskColMinWidth(c),Math.min(_taskColMaxWidth(c),Math.round(max)))});"
+    "const wrap=($('trows')||{}).closest?($('trows').closest('.table-wrap')||$('trows').closest('section')):null;"
+    "const avail=Math.max(640,(wrap&&wrap.clientWidth?wrap.clientWidth:0)-16);let sum=cols.reduce((a,c)=>a+(next[c]||0),0);"
+    "if(sum<avail){let extra=avail-sum;const flex=cols.filter(c=>_TASK_COL_FLEX.has(c));let loops=0;"
+    "while(extra>2&&flex.length&&loops<24){const share=Math.ceil(extra/flex.length);flex.forEach(c=>{if(extra<=0)return;"
+    "const add=Math.min(share,extra,_taskColMaxWidth(c)-(next[c]||0));if(add>0){next[c]+=add;extra-=add;sum+=add}});loops++}}"
+    "_taskColWidths=next;_taskColsApplyLayout();if(mode==='auto'||mode===true)_taskColsSaveWidthsDebounced();if(mode===true)toast('Colunas auto-ajustadas')}"
+    "function taskColsAutoFit(){_taskColsAutoFit(true)}"
+    "function taskColStartResize(ev,col){ev.preventDefault();ev.stopPropagation();const th=ev.target.closest('th');if(!th)return;"
+    "const startX=ev.clientX;const startW=th.offsetWidth||Number(_taskColWidths[col]||120);"
+    "_taskColResize={col,startX,startW};document.body.style.cursor='col-resize';document.body.style.userSelect='none';"
+    "window.addEventListener('mousemove',taskColDoResize);window.addEventListener('mouseup',taskColEndResize,{once:true})}"
+    "function taskColDoResize(ev){if(!_taskColResize)return;const dx=ev.clientX-_taskColResize.startX;const col=_taskColResize.col;"
+    "const w=Math.max(_taskColMinWidth(col),Math.min(_taskColMaxWidth(col),Math.round(_taskColResize.startW+dx)));"
+    "_taskColWidths[col]=w;_taskColsApplyLayout()}"
+    "function taskColEndResize(){if(!_taskColResize){window.removeEventListener('mousemove',taskColDoResize);return}"
+    "_taskColResize=null;document.body.style.cursor='';document.body.style.userSelect='';window.removeEventListener('mousemove',taskColDoResize);"
+    "_taskColsSaveWidthsDebounced()}"
+    "function _taskColsSaveWidthsDebounced(){if(_taskColSaveTimer)clearTimeout(_taskColSaveTimer);"
+    "_taskColSaveTimer=setTimeout(()=>{_taskColsSaveWidths().catch(()=>{})},650)}"
+    "async function _taskColsSaveWidths(){const cols=_taskColsNormalize(_taskColsVisible);if(!cols.length)return;"
+    "const widths={};cols.forEach(c=>{const w=Number(_taskColWidths[c]||0);if(w>0)widths[c]=w});"
+    "await api('/api/tasks/columns/prefs',{method:'POST',body:JSON.stringify({columns:cols,widths})})}"
 )
 
 
 def _patch_html_tasks(html: str) -> str:
+    html = html.replace(
+        '<label style="padding-top:30px"><input type="checkbox" id="tf_blocked"> Só bloqueadas</label><button class="btn" onclick="clearTaskFilters()">Limpar filtros</button>',
+        '<label style="padding-top:30px"><input type="checkbox" id="tf_blocked"> Só bloqueadas</label>'
+        '<label style="padding-top:30px"><input type="checkbox" id="tf_show_done" onchange="loadTasks()"> Concluídas</label>'
+        '<button class="btn" onclick="clearTaskFilters()">Limpar filtros</button>',
+        1,
+    )
+    html = html.replace(
+        "blocked:$('tf_blocked')?.checked,involved:$('tf_involved')?.value",
+        "blocked:$('tf_blocked')?.checked,show_done:$('tf_show_done')?.checked,involved:$('tf_involved')?.value",
+        1,
+    )
+    html = html.replace(
+        "if($('tf_blocked'))$('tf_blocked').checked=!!o.blocked;if(o.involved&&$('tf_involved'))",
+        "if($('tf_blocked'))$('tf_blocked').checked=!!o.blocked;if($('tf_show_done'))$('tf_show_done').checked=!!o.show_done;if(o.involved&&$('tf_involved'))",
+        1,
+    )
+    html = html.replace(
+        "if($('tf_blocked'))$('tf_blocked').checked=false;if($('tf_involved'))$('tf_involved').value='';",
+        "if($('tf_blocked'))$('tf_blocked').checked=false;if($('tf_show_done'))$('tf_show_done').checked=false;if($('tf_involved'))$('tf_involved').value='';",
+        1,
+    )
+    html = html.replace(
+        "if($('tf_blocked')?.checked)p.set('blocked_only','1');const im=$('tf_involved')",
+        "if($('tf_blocked')?.checked)p.set('blocked_only','1');if($('tf_show_done')?.checked)p.set('show_done','1');const im=$('tf_involved')",
+        1,
+    )
     html = html.replace(
         '<input id="tf_q" placeholder="TaskID, tarefa, descrição...">',
         '<input id="tf_q" placeholder="TaskID, tarefa, responsável, workers...">',
@@ -1278,7 +1659,8 @@ def _patch_html_tasks(html: str) -> str:
     html = html.replace(
         '<button class="btn" onclick="openExcelFiltersModal()">Filtros Excel</button>',
         '<button class="btn" onclick="openExcelFiltersModal()">Filtros Excel</button>'
-        '<button class="btn" onclick="openTaskColsModal()">Colunas</button>',
+        '<button class="btn" onclick="openTaskColsModal()">Colunas</button>'
+        '<button class="btn" onclick="taskColsAutoFit()">Auto-ajustar</button>',
         1,
     )
     html = html.replace(
@@ -1409,8 +1791,7 @@ def _patch_html_tasks(html: str) -> str:
         "async function loadTasks(){try{saveTaskFilters();const p=tqs();if($('tf_mine')?.checked)p.delete('only_mine');"
         "let j=await api('/api/tasks?'+p);"
         "await taskColsEnsureLoaded();"
-        "let _rows=(j.rows||[]);if(window._dash_open_only){_rows=_rows.filter(r=>String(r?.Estado||'').trim().toLowerCase()!=='concluído');window._dash_open_only=false}"
-        "taskRows=_mineApplyRows(_rows);"
+        "let _rows=(j.rows||[]);taskRows=_mineApplyRows(_rows);"
         "if(_taskSortCol)sortTasks(_taskSortCol,true);else renderTasks();"
         "const k=($('tf_mine')?.checked)?_mineKpis(taskRows):(j.kpis||{});"
         "$('tk_total').textContent=k.total??0;$('tk_open').textContent=k.open??0;$('tk_done').textContent=k.done??0;"
@@ -1420,17 +1801,20 @@ def _patch_html_tasks(html: str) -> str:
     )
     html = html.replace(
         "let _detailTid=null,_detailData=null;",
-        _TASK_COL_PREFS_JS + "renderTasks=_renderTasksBySqlCols;let _detailTid=null,_detailData=null;",
+        _TASK_COL_PREFS_JS + _TASK_COL_WIDTH_JS + "renderTasks=_renderTasksBySqlCols;let _detailTid=null,_detailData=null;",
         1,
     )
     html = re.sub(
         r"function detailAllItems\(\)\{.*?function renderDetailAttachments\(\)\{",
-        "let _tdActQuick='all';"
+        "let _tdActQuick='all';let _detailFormKind='ACTION';"
         "function detailSetQuickFilter(v){_tdActQuick=String(v||'all');renderDetailActions()}"
         "function _toBool(v){const s=String(v??'').trim().toLowerCase();if(s===''||s==='0'||s==='false'||s==='no'||s==='off'||s==='null'||s==='none')return false;"
         "if(s==='1'||s==='true'||s==='yes'||s==='on')return true;return !!v}"
+        "function _detailHasRealActionMeta(o){const meta=!!String(o.owner||o.workers||o.start_date||o.due_date||o.evidence||o.blocked_reason||'').trim();"
+        "if(meta)return true;const st=String(o.status||'').trim().toLowerCase();return !!(st&&st!=='não iniciado'&&st!=='nao iniciado'&&st!=='concluído'&&st!=='concluido');}"
+        "function tdEnsureItemKindField(){const frm=$('td_item_form');if(!frm)return;let el=$('td_item_kind');if(!el){el=document.createElement('input');el.type='hidden';el.id='td_item_kind';frm.insertBefore(el,frm.firstChild)}}"
         "function _detailNorm(it,kind){const o=Object.assign({},it||{});let k=String(o.kind||kind||'').trim().toUpperCase();"
-        "const hasActionMeta=!!String(o.owner||o.workers||o.status||o.start_date||o.due_date||o.evidence||o.blocked_reason||'').trim();"
+        "const hasActionMeta=_detailHasRealActionMeta(o);"
         "if(k!=='ACTION'&&k!=='CHECK')k=hasActionMeta?'ACTION':'CHECK';"
         "else if(k==='CHECK'&&hasActionMeta)k='ACTION';"
         "o.kind=k;o.item_text=String(o.item_text||o.action_text||o.text||'').trim();"
@@ -1516,7 +1900,7 @@ def _patch_html_tasks(html: str) -> str:
         "if(checks.length){const trh=document.createElement('tr');trh.className='act-section';trh.innerHTML='<td colspan=\"6\">CHECKLIST</td>';tb.appendChild(trh);"
         "checks.forEach(a=>{const tr=document.createElement('tr');tr.className='check-row '+a._ui.state+(_detailItemSel===a.id?' sel':'');tr.onclick=()=>detailSelectItem(a.id);tr.ondblclick=()=>{if(_detailEdit)detailToggleCheck(a.id)};"
         "const chk=`<input type=\"checkbox\" ${a.done?'checked':''} onclick=\"event.stopPropagation();detailToggleCheck(${a.id})\">`;"
-        "tr.innerHTML=`<td>${chk}</td><td colspan=\"4\"><div class=\"check-text\">${esc(a.item_text||'')}</div><div class=\"muted\">Prazo: ${esc((a.due_date||'').slice(0,10)||'—')}</div></td><td><button class=\"btn\" onclick=\"detailItemMenu(${a.id},event)\">...</button></td>`;tb.appendChild(tr)})}"
+        "tr.innerHTML=`<td>${chk}</td><td colspan=\"4\"><div class=\"check-text\">${esc(a.item_text||'')}</div></td><td><button class=\"btn\" onclick=\"detailItemMenu(${a.id},event)\">...</button></td>`;tb.appendChild(tr)})}"
         "if($('td_act_edit_btn'))$('td_act_edit_btn').disabled=!_detailEdit||!_detailItemSel;if($('td_act_del_btn'))$('td_act_del_btn').disabled=!_detailEdit||!_detailItemSel;updateDetailActionStats()}"
         "function renderDetailAttachments(){",
         html,
@@ -1562,7 +1946,7 @@ def _patch_html_tasks(html: str) -> str:
         "function tdToggleWorker(name){const el=$('td_item_workers');if(!el)return;const n=String(name||'').trim();if(!n)return;"
         "const arr=String(el.value||'').split(',').map(v=>String(v||'').trim()).filter(v=>v);const low=n.toLowerCase();const idx=arr.findIndex(v=>v.toLowerCase()===low);"
         "if(idx>=0)arr.splice(idx,1);else arr.push(n);el.value=arr.join(', ')}"
-        "function detailShowItemForm(kind){const k=String(kind||'ACTION').toUpperCase();if($('td_item_kind'))$('td_item_kind').value=k;const isCh=k==='CHECK';tdEnsureActionUserInputs();tdEnsureActionNotesUi();tdEnsureActionDepsUi();"
+        "function detailShowItemForm(kind){const k=String(kind||_detailFormKind||'ACTION').toUpperCase();_detailFormKind=k;tdEnsureItemKindField();if($('td_item_kind'))$('td_item_kind').value=k;const isCh=k==='CHECK';tdEnsureActionUserInputs();tdEnsureActionNotesUi();tdEnsureActionDepsUi();"
         "['td_item_owner_f','td_item_status_f','td_item_start_f','td_item_due_f','td_item_workers_f','td_item_ev_f','td_item_blk_f','td_item_notes_f','td_item_deps_f'].forEach(id=>{const el=$(id);if(el)el.style.display=isCh?'none':'block'});"
         "const frm=$('td_item_form');if(frm)frm.style.display='grid';tdRefreshActionDepsInfo()}",
         1,
@@ -1626,11 +2010,12 @@ def _patch_html_tasks(html: str) -> str:
     html = re.sub(
         r"async function detailSaveItem\(\)\{[\s\S]*?\}\s*async function detailDelItem\(\)",
         "async function detailSaveItem(){try{if(!_detailTid)return;"
-        "const kind=String($('td_item_kind')?.value||'ACTION').toUpperCase();"
+        "const kind=String($('td_item_kind')?.value||_detailFormKind||'ACTION').toUpperCase();"
         "const p={item_text:String($('td_item_text')?.value||'').trim()};"
         "const id=String($('td_item_id')?.value||'').trim();"
         "if(!p.item_text){toast('Texto obrigatório',true);return}"
-        "if(kind==='ACTION'){Object.assign(p,{owner:String($('td_item_owner')?.value||'').trim(),status:String($('td_item_status')?.value||'').trim(),start_date:String($('td_item_start')?.value||'').slice(0,10),due_date:String($('td_item_due')?.value||'').slice(0,10),workers:String($('td_item_workers')?.value||'').trim(),evidence:String($('td_item_evidence')?.value||'').trim(),blocked_reason:String($('td_item_blocked')?.value||'').trim(),action_notes:String(getRtHtml('td_item_notes_rt')||'').trim()});"
+        "if(kind==='ACTION'){if(typeof validateDetailActionRequired==='function'&&!validateDetailActionRequired())return;"
+        "Object.assign(p,{owner:String($('td_item_owner')?.value||'').trim(),status:String($('td_item_status')?.value||'').trim(),start_date:String($('td_item_start')?.value||'').slice(0,10),due_date:String($('td_item_due')?.value||'').slice(0,10),workers:String($('td_item_workers')?.value||'').trim(),evidence:String($('td_item_evidence')?.value||'').trim(),blocked_reason:String($('td_item_blocked')?.value||'').trim(),action_notes:String(getRtHtml('td_item_notes_rt')||'').trim()});"
         "const st=String(p.status||'').trim().toLowerCase();if(st==='bloqueado'&&!String(p.blocked_reason||'').trim()){toast('Motivo é obrigatório quando Bloqueado',true);return}}"
         "if(id){"
         "if(kind==='ACTION')await api('/api/actions/'+encodeURIComponent(id),{method:'PUT',body:JSON.stringify(p)});"
@@ -1660,6 +2045,10 @@ def _patch_html_tasks(html: str) -> str:
         "function validateTaskModalRequired(){const req=[['tm_tarefa','Tarefa'],['tm_resp','Responsável'],['tm_estado','Estado'],['tm_prio','Prioridade'],['tm_milestone','Milestone'],['tm_projeto','Projeto'],['tm_linha','Linha'],['tm_maquina','Máquina'],['tm_prazo','Prazo']];"
         "const miss=[];req.forEach(([id,label])=>{const el=$(id);if(!el)return;const ok=String(el.value||'').trim().length>0;if(!ok)miss.push(label);el.style.borderColor=ok?'':'#dc2626'});"
         "if(miss.length){toast('Campos obrigatórios: '+miss.join(', '),true);return false}return true}"
+        "function validateDetailActionRequired(){const kind=String($('td_item_kind')?.value||_detailFormKind||'ACTION').toUpperCase();if(kind!=='ACTION')return true;"
+        "const req=[['td_item_text','Título/Texto'],['td_item_owner','Owner'],['td_item_due','Prazo']];"
+        "const miss=[];req.forEach(([id,label])=>{const el=$(id);if(!el)return;const ok=String(el?.value||'').trim().length>0;if(!ok)miss.push(label);if(el.style)el.style.borderColor=ok?'':'#dc2626'});"
+        "if(miss.length){toast('Campos obrigatórios: '+miss.join(', '),true);const first=req.find(([id])=>{const el=$(id);return el&&!String(el.value||'').trim()});if(first){try{$(first[0])?.focus()}catch(_){ }}return false}return true}"
         "async function openTaskModal(tid,mode){",
         1,
     )
@@ -1685,6 +2074,775 @@ def _patch_html_tasks(html: str) -> str:
         _FOLDER_SECTION,
         html,
         count=1,
+    )
+    _detail_action_validate_fn = (
+        "function validateDetailActionRequired(){const kind=String($('td_item_kind')?.value||_detailFormKind||'ACTION').toUpperCase();if(kind!=='ACTION')return true;"
+        "const req=[['td_item_text','Título/Texto'],['td_item_owner','Owner'],['td_item_due','Prazo']];"
+        "const miss=[];req.forEach(([id,label])=>{const el=$(id);if(!el)return;const ok=String(el?.value||'').trim().length>0;if(!ok)miss.push(label);if(el.style)el.style.borderColor=ok?'':'#dc2626'});"
+        "if(miss.length){toast('Campos obrigatórios: '+miss.join(', '),true);const first=req.find(([id])=>{const el=$(id);return el&&!String(el.value||'').trim()});if(first){try{$(first[0])?.focus()}catch(_){ }}return false}return true}"
+    )
+    _task_complete_validate_fn = (
+        "function _estadoIsConcluido(v){const s=String(v||'').trim().toLowerCase();return s==='concluído'||s==='concluido'}"
+        "function _checklistItemIsDone(a){if(!a)return true;if(a.done||a.is_done)return true;"
+        "const st=String(a.status||'').trim().toLowerCase();return st==='concluído'||st==='concluido'}"
+        "function _openChecklistItems(items){return(items||[]).filter(a=>!_checklistItemIsDone(a))}"
+        "function _taskCompleteBlockMessage(open){const acts=open.filter(a=>String(a.kind||'').toUpperCase()==='ACTION');"
+        "const chks=open.filter(a=>String(a.kind||'').toUpperCase()!=='ACTION');const parts=[];"
+        "if(acts.length){const na=acts.length;if(na===1)parts.push('1 ação («'+String(acts[0].item_text||'').slice(0,80)+'»)');"
+        "else parts.push(na+' ações por concluir')}if(chks.length){const nc=chks.length;if(nc===1)parts.push('1 check («'+String(chks[0].item_text||'').slice(0,80)+'»)');"
+        "else parts.push(nc+' checks por concluir')}return 'Não pode concluir a tarefa: ainda existem '+parts.join(' e ')+'.'}"
+        "async function validateTaskCanComplete(estado,tid){if(!_estadoIsConcluido(estado))return true;const tidS=String(tid||'').trim();if(!tidS)return true;"
+        "let open=[];if(String(_detailTid||'')===tidS&&typeof detailAllItems==='function'&&_detailData){open=_openChecklistItems(detailAllItems())}"
+        "else{try{const j=await api('/api/tasks/'+encodeURIComponent(tidS)+'/detail');open=_openChecklistItems([...(j.actions||[]),...(j.checklist||[])])}catch(_){return true}}"
+        "if(!open.length)return true;toast(_taskCompleteBlockMessage(open),true);return false}"
+    )
+    html = html.replace(
+        "if(kind==='ACTION'){Object.assign(p,{owner:String($('td_item_owner')",
+        "if(kind==='ACTION'){if(typeof validateDetailActionRequired==='function'&&!validateDetailActionRequired())return;"
+        "Object.assign(p,{owner:String($('td_item_owner')",
+        1,
+    )
+    if "function validateDetailActionRequired" not in html:
+        _validate_prefix = _detail_action_validate_fn
+        if "function validateTaskCanComplete" not in html:
+            _validate_prefix += _task_complete_validate_fn
+        if "function validateTaskModalRequired()" in html:
+            html = html.replace(
+                "function validateTaskModalRequired(){",
+                _validate_prefix + "function validateTaskModalRequired(){",
+                1,
+            )
+        elif "async function openTaskModal(tid,mode){" in html:
+            html = html.replace(
+                "async function openTaskModal(tid,mode){",
+                _validate_prefix + "async function openTaskModal(tid,mode){",
+                1,
+            )
+    elif "function validateTaskCanComplete" not in html:
+        if "function validateDetailActionRequired()" in html:
+            html = html.replace(
+                "function validateDetailActionRequired(){",
+                _task_complete_validate_fn + "function validateDetailActionRequired(){",
+                1,
+            )
+        elif "function validateTaskModalRequired()" in html:
+            html = html.replace(
+                "function validateTaskModalRequired(){",
+                _task_complete_validate_fn + "function validateTaskModalRequired(){",
+                1,
+            )
+        elif "async function quickSetStatus(tid,current){" in html:
+            html = html.replace(
+                "async function quickSetStatus(tid,current){",
+                _task_complete_validate_fn + "async function quickSetStatus(tid,current){",
+                1,
+            )
+    if "validateTaskCanComplete(t.Estado,_detailTid)" not in html:
+        html = html.replace(
+            "async function saveTaskDetail(force){try{if(!_detailTid)return;const t=readDetailTaskFields();",
+            "async function saveTaskDetail(force){try{if(!_detailTid)return;const t=readDetailTaskFields();"
+            "if(typeof validateTaskCanComplete==='function'&&!await validateTaskCanComplete(t.Estado,_detailTid))return;",
+            1,
+        )
+    if "validateTaskCanComplete(p.Estado,id)" not in html:
+        html = html.replace(
+            "const p=taskPayload();const id=$('tm_id').value;const createFolder=",
+            "const p=taskPayload();const id=$('tm_id').value;"
+            "if(id&&typeof validateTaskCanComplete==='function'&&!await validateTaskCanComplete(p.Estado,id))return;"
+            "const createFolder=",
+            1,
+        )
+    if "validateTaskCanComplete(pick,tid)" not in html:
+        html = html.replace(
+            "if(!states.includes(pick)){toast('Estado inválido',true);return}await api('/api/board/move',{method:'POST',body:JSON.stringify({task_id:tid,estado:pick})});",
+            "if(!states.includes(pick)){toast('Estado inválido',true);return}"
+            "if(typeof validateTaskCanComplete==='function'&&!await validateTaskCanComplete(pick,tid))return;"
+            "await api('/api/board/move',{method:'POST',body:JSON.stringify({task_id:tid,estado:pick})});",
+            1,
+        )
+    return _patch_html_tasks_visual(html)
+
+
+_TASKS_KPIS_OLD = (
+    '<section class="kpis"><div class="kpi"><div class="ico">📋</div><div><div class="muted">Total</div>'
+    '<div class="v" id="tk_total">0</div></div></div><div class="kpi"><div class="ico">📝</div><div>'
+    '<div class="muted">A fazer</div><div class="v" id="tk_open">0</div></div></div><div class="kpi">'
+    '<div class="ico">✅</div><div><div class="muted">Concluídas</div><div class="v" id="tk_done">0</div></div></div>'
+    '<div class="kpi"><div class="ico">⏰</div><div><div class="muted">Atrasadas</div><div class="v" id="tk_overdue">0</div>'
+    '</div></div><div class="kpi"><div class="ico">🚫</div><div><div class="muted">Bloqueadas</div>'
+    '<div class="v" id="tk_blocked">0</div></div></div></section>'
+)
+
+_TASKS_KPIS_NEW = (
+    '<section class="kpis tk-kpis">'
+    '<div class="kpi kpi-click" onclick="tkFilterKpi(\'all\')" title="Mostrar todas">'
+    '<div class="ico">📋</div><div><div class="muted">Total</div><div class="v" id="tk_total">0</div>'
+    '<div class="muted db-sub">Todas as tarefas</div></div></div>'
+    '<div class="kpi kpi-click" onclick="tkFilterKpi(\'open\')" title="Filtrar abertas">'
+    '<div class="ico">📝</div><div><div class="muted">A fazer</div><div class="v" id="tk_open">0</div>'
+    '<div class="muted db-sub">Não concluídas</div></div></div>'
+    '<div class="kpi kpi-click" onclick="tkFilterKpi(\'done\')" title="Filtrar concluídas">'
+    '<div class="ico">✅</div><div><div class="muted">Concluídas</div><div class="v" id="tk_done">0</div>'
+    '<div class="muted db-sub">Estado concluído</div></div></div>'
+    '<div class="kpi kpi-click" onclick="tkFilterKpi(\'overdue\')" title="Filtrar atrasadas">'
+    '<div class="ico">⏰</div><div><div class="muted">Atrasadas</div><div class="v" id="tk_overdue">0</div>'
+    '<div class="muted db-sub">Prazo vencido</div></div></div>'
+    '<div class="kpi kpi-click" onclick="tkFilterKpi(\'blocked\')" title="Filtrar bloqueadas">'
+    '<div class="ico">🚫</div><div><div class="muted">Bloqueadas</div><div class="v" id="tk_blocked">0</div>'
+    '<div class="muted db-sub">Com bloqueios</div></div></div>'
+    "</section>"
+)
+
+_TASKS_FILTERS_OLD = (
+    '<section class="card filters" id="task-filters"><b>🔎 Filtros</b><div class="grid" style="margin-top:14px">'
+    '<div class="field"><label>Pesquisa</label><input id="tf_q" placeholder="TaskID, tarefa, responsável, workers..."></div>'
+    '<div class="field"><label>Estado</label><select id="tf_estado"></select></div>'
+    '<div class="field"><label>Prioridade</label><select id="tf_prio"></select></div>'
+    '<div class="field"><label>Responsável</label><select id="tf_resp"></select></div>'
+    '<div class="field"><label>Milestone</label><select id="tf_milestone"></select></div>'
+    '<div class="field"><label>Assunto</label><select id="tf_assunto"></select></div>'
+    '<div class="field"><label>Projeto</label><select id="tf_projeto"></select></div>'
+    '<div class="field"><label>Linha</label><select id="tf_linha"></select></div>'
+    '<div class="field"><label>Máquina</label><select id="tf_maquina"></select></div>'
+    '<div class="field"><label>Prazo de</label><input id="tf_from" type="date"></div>'
+    '<div class="field"><label>Prazo até</label><input id="tf_to" type="date"></div>'
+    '<label style="padding-top:30px"><input type="checkbox" id="tf_mine"> Apenas minhas</label>'
+    '<div class="field"><label>Envolvido</label><select id="tf_involved">'
+    '<option value="">Todos</option><option value="1">Modo 1 — Responsável</option>'
+    '<option value="2">Modo 2 — +Workers</option><option value="3">Modo 3 — +Ações</option></select></div>'
+    '<label style="padding-top:30px"><input type="checkbox" id="tf_overdue"> Só atrasadas</label>'
+    '<label style="padding-top:30px"><input type="checkbox" id="tf_blocked"> Só bloqueadas</label>'
+    '<label style="padding-top:30px"><input type="checkbox" id="tf_show_done" onchange="loadTasks()"> Concluídas</label>'
+    '<button class="btn" onclick="clearTaskFilters()">Limpar filtros</button></div></section>'
+)
+
+_TASKS_FILTERS_NEW = (
+    '<section class="card filters tk-filters" id="task-filters" style="padding:12px">'
+    '<div class="tk-filters-head"><b>🔎 Filtros</b>'
+    '<button type="button" class="btn tk-adv-toggle" onclick="tasksToggleAdvanced()">'
+    '<span id="tk_adv_lbl">Mostrar avançados</span></button>'
+    '<button class="btn" type="button" onclick="clearTaskFilters()">Limpar filtros</button></div>'
+    '<div class="grid tk-filters-main">'
+    '<div class="field span2"><label>Pesquisa</label>'
+    '<input id="tf_q" placeholder="TaskID, tarefa, responsável, workers..."></div>'
+    '<div class="field"><label>Estado</label><select id="tf_estado"></select></div>'
+    '<div class="field"><label>Prioridade</label><select id="tf_prio"></select></div>'
+    '<div class="field"><label>Responsável</label><select id="tf_resp"></select></div>'
+    '<div class="field"><label>Projeto</label><select id="tf_projeto"></select></div>'
+    '<div class="field tk-chips-wrap"><label>Filtros rápidos</label>'
+    '<div class="tk-chips">'
+    '<label class="tk-chip"><input type="checkbox" id="tf_mine"> Minhas</label>'
+    '<label class="tk-chip"><input type="checkbox" id="tf_overdue"> Atrasadas</label>'
+    '<label class="tk-chip"><input type="checkbox" id="tf_blocked"> Bloqueadas</label>'
+    '<label class="tk-chip"><input type="checkbox" id="tf_show_done"> Concluídas</label>'
+    "</div></div></div>"
+    '<div class="grid tk-filters-adv" id="tk_filters_adv" style="display:none">'
+    '<div class="field"><label>Milestone</label><select id="tf_milestone"></select></div>'
+    '<div class="field"><label>Assunto</label><select id="tf_assunto"></select></div>'
+    '<div class="field"><label>Linha</label><select id="tf_linha"></select></div>'
+    '<div class="field"><label>Máquina</label><select id="tf_maquina"></select></div>'
+    '<div class="field"><label>Prazo de</label><input id="tf_from" type="date"></div>'
+    '<div class="field"><label>Prazo até</label><input id="tf_to" type="date"></div>'
+    '<div class="field"><label>Envolvido</label><select id="tf_involved">'
+    '<option value="">Todos</option><option value="1">Modo 1 — Responsável</option>'
+    '<option value="2">Modo 2 — +Workers</option><option value="3">Modo 3 — +Ações</option></select></div>'
+    "</div></section>"
+)
+
+_TASKS_TOOLBAR_OLD = (
+    '<div class="toolbar"><button class="btn primary" id="tb_new" onclick="newTask()">＋ Nova</button>'
+    '<button class="btn" id="tb_edit" onclick="editTaskSel()" disabled>Editar</button>'
+    '<button class="btn" id="tb_dup" onclick="dupTaskSel()" disabled>Duplicar</button>'
+    '<button class="btn danger" id="tb_del" onclick="delTaskSel()" disabled>Apagar</button>'
+    '<button class="btn" onclick="exportTasksCsv()">Exportar CSV</button>'
+    '<button class="btn" onclick="openPortfolioGantt()">📊 Gantt</button>'
+    '<button class="btn" onclick="exportTasksXls()">Exportar Excel</button>'
+    '<button class="btn" onclick="openExcelFiltersModal()">Filtros Excel</button>'
+    '<button class="btn" onclick="openTaskColsModal()">Colunas</button>'
+    '<button class="btn" onclick="taskColsAutoFit()">Auto-ajustar</button>'
+    '<button class="btn" id="tb_folder" onclick="openTaskFolderSel()" disabled>Abrir pasta</button>'
+    '<button class="btn" id="tb_link" onclick="openTaskLinkSel()" disabled>Abrir link</button>'
+    '<button class="btn" onclick="openArchiveModal()">Arquivo</button>'
+    '<span class="spacer"></span><button class="btn" onclick="loadTasks()">Atualizar</button></div>'
+)
+
+_TASKS_TOOLBAR_NEW = (
+    '<div class="toolbar tk-toolbar">'
+    '<div class="tk-tb-group">'
+    '<button class="btn primary" id="tb_new" onclick="newTask()">＋ Nova</button>'
+    '<button class="btn" id="tb_edit" onclick="editTaskSel()" disabled>Editar</button>'
+    '<button class="btn" id="tb_dup" onclick="dupTaskSel()" disabled>Duplicar</button>'
+    '<button class="btn danger" id="tb_del" onclick="delTaskSel()" disabled>Apagar</button>'
+    "</div><div class=\"tk-tb-sep\"></div><div class=\"tk-tb-group\">"
+    '<button class="btn" onclick="exportTasksCsv()">Exportar CSV</button>'
+    '<button class="btn" onclick="openPortfolioGantt()">📊 Gantt</button>'
+    '<button class="btn" onclick="exportTasksXls()">Exportar Excel</button>'
+    '<button class="btn" onclick="openExcelFiltersModal()">Filtros Excel</button>'
+    "</div><div class=\"tk-tb-sep\"></div><div class=\"tk-tb-group\">"
+    '<button class="btn" onclick="openTaskColsModal()">Colunas</button>'
+    '<button class="btn" onclick="taskColsAutoFit()">Auto-ajustar</button>'
+    '<button class="btn" id="tb_folder" onclick="openTaskFolderSel()" disabled>Abrir pasta</button>'
+    '<button class="btn" id="tb_link" onclick="openTaskLinkSel()" disabled>Abrir link</button>'
+    '<button class="btn" onclick="openArchiveModal()">Arquivo</button>'
+    "</div><span class=\"spacer\"></span>"
+    '<button class="btn" onclick="loadTasks()">Atualizar</button></div>'
+)
+
+_TASKS_FOOTER_HTML = (
+    '<section class="card tasks-footer" id="tasks-footer">'
+    '<div class="tk-foot-grid">'
+    '<div class="tk-foot-stats">'
+    '<div class="tk-foot-item"><span class="tk-foot-lbl">Atrasadas</span>'
+    '<span class="tk-foot-v" id="tk_f_overdue">0</span>'
+    '<span class="tk-foot-pct muted" id="tk_f_overdue_pct">0%</span></div>'
+    '<div class="tk-foot-item"><span class="tk-foot-lbl">Em risco</span>'
+    '<span class="tk-foot-v" id="tk_f_risk">0</span>'
+    '<span class="tk-foot-pct muted" id="tk_f_risk_pct">0%</span></div>'
+    '<div class="tk-foot-item"><span class="tk-foot-lbl">Concluídas</span>'
+    '<span class="tk-foot-v" id="tk_f_done">0</span>'
+    '<span class="tk-foot-pct muted" id="tk_f_done_pct">0%</span></div>'
+    '<div class="tk-foot-item"><span class="tk-foot-lbl">Bloqueadas</span>'
+    '<span class="tk-foot-v" id="tk_f_blocked">0</span>'
+    '<span class="tk-foot-pct muted" id="tk_f_blocked_pct">0%</span></div>'
+    '<div class="tk-foot-item"><span class="tk-foot-lbl">Sem prazo</span>'
+    '<span class="tk-foot-v" id="tk_f_nodue">0</span>'
+    '<span class="tk-foot-pct muted" id="tk_f_nodue_pct">0%</span></div>'
+    "</div>"
+    '<div class="tk-foot-ring-wrap"><div class="tk-foot-ring">'
+    '<svg viewBox="0 0 36 36" class="tk-ring" aria-hidden="true">'
+    '<path class="tk-ring-bg" d="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"/>'
+    '<path class="tk-ring-fg" id="tk_ring_fg" stroke-dasharray="0,100" '
+    'd="M18 2.0845 a 15.9155 15.9155 0 0 1 0 31.831 a 15.9155 15.9155 0 0 1 0 -31.831"/></svg>'
+    '<div class="tk-ring-lbl"><span id="tk_prog_pct">0%</span><span class="muted">Progresso</span></div>'
+    "</div></div></div></section>"
+)
+
+_TASKS_V1_CSS = (
+    "#page-tasks .tk-kpis .kpi{min-height:92px}"
+    "#page-tasks .tk-filters-head{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin-bottom:10px}"
+    "#page-tasks .tk-filters-head .btn{margin-left:auto}"
+    "#page-tasks .tk-filters-head .tk-adv-toggle{margin-left:0}"
+    "#page-tasks .tk-filters-main{display:grid;grid-template-columns:repeat(6,minmax(120px,1fr));gap:10px;align-items:end}"
+    "#page-tasks .tk-filters-main .field{margin:0;min-width:0}"
+    "#page-tasks .tk-filters-main .span2{grid-column:span 2}"
+    "#page-tasks .tk-chips-wrap{grid-column:1/-1}"
+    "#page-tasks .tk-chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:4px}"
+    "#page-tasks .tk-chip{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border-radius:999px;"
+    "background:#f1f5f9;border:1px solid #dbe3ee;font-size:12px;cursor:pointer;user-select:none}"
+    "#page-tasks .tk-chip input{margin:0}"
+    "#page-tasks .tk-filters-adv{display:grid;grid-template-columns:repeat(4,minmax(120px,1fr));gap:10px;margin-top:10px;padding-top:10px;border-top:1px dashed #dbe3ee}"
+    "#page-tasks .tk-toolbar{gap:8px;align-items:center}"
+    "#page-tasks .tk-tb-group{display:flex;flex-wrap:wrap;gap:6px;align-items:center}"
+    "#page-tasks .tk-tb-sep{width:1px;height:28px;background:#dbe3ee;margin:0 2px}"
+    "#page-tasks .tasks-footer{margin-top:12px;padding:12px 14px}"
+    "#page-tasks .tk-foot-grid{display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}"
+    "#page-tasks .tk-foot-stats{display:flex;flex-wrap:wrap;gap:14px 18px;flex:1;min-width:280px}"
+    "#page-tasks .tk-foot-item{display:flex;flex-direction:column;gap:2px;min-width:72px}"
+    "#page-tasks .tk-foot-lbl{font-size:11px;color:#64748b}"
+    "#page-tasks .tk-foot-v{font-size:18px;font-weight:700;line-height:1.1}"
+    "#page-tasks .tk-foot-pct{font-size:11px}"
+    "#page-tasks .tk-foot-ring-wrap{display:flex;justify-content:flex-end}"
+    "#page-tasks .tk-foot-ring{position:relative;width:72px;height:72px}"
+    "#page-tasks .tk-ring{width:100%;height:100%;transform:rotate(-90deg)}"
+    "#page-tasks .tk-ring-bg{fill:none;stroke:#e5e7eb;stroke-width:3.2}"
+    "#page-tasks .tk-ring-fg{fill:none;stroke:#16a34a;stroke-width:3.2;stroke-linecap:round;transition:stroke-dasharray .25s ease}"
+    "#page-tasks .tk-ring-lbl{position:absolute;inset:0;display:flex;flex-direction:column;align-items:center;justify-content:center;font-size:11px;line-height:1.15}"
+    "#page-tasks .tk-ring-lbl span:first-child{font-size:15px;font-weight:700;color:#166534}"
+    "#page-tasks .tk-pill{display:inline-flex;align-items:center;padding:2px 9px;border-radius:999px;font-size:11px;font-weight:600;white-space:nowrap}"
+    "#page-tasks .tk-pill-wait{background:#e2e8f0;color:#334155}"
+    "#page-tasks .tk-pill-prog{background:#dbeafe;color:#1d4ed8}"
+    "#page-tasks .tk-pill-done{background:#dcfce7;color:#166534}"
+    "#page-tasks .tk-pill-block{background:#ffedd5;color:#9a3412}"
+    "#page-tasks .tk-pill-prio-low{background:#ecfdf5;color:#047857}"
+    "#page-tasks .tk-pill-prio-med{background:#fef9c3;color:#854d0e}"
+    "#page-tasks .tk-pill-prio-high{background:#fee2e2;color:#991b1b}"
+    "#page-tasks #trows tr[class*='tk-row-'] td:first-child{position:relative}"
+    "#page-tasks #trows tr[class*='tk-row-'] td:first-child::before{content:'';position:absolute;left:0;top:0;bottom:0;width:3px;border-radius:0 2px 2px 0}"
+    "#page-tasks #trows tr.tk-row-overdue td:first-child::before{background:#dc2626}"
+    "#page-tasks #trows tr.tk-row-blocked td:first-child::before{background:#ea580c}"
+    "#page-tasks #trows tr.tk-row-progress td:first-child::before{background:#2563eb}"
+    "#page-tasks #trows tr.tk-row-done td:first-child::before{background:#16a34a}"
+    "#page-tasks .tk-due-main{font-weight:600}"
+    "#page-tasks .tk-due-sub{font-size:11px;color:#b91c1c;margin-top:2px}"
+    "#page-tasks .tk-due-ok .tk-due-sub{color:#64748b}"
+    "@media(max-width:1200px){#page-tasks .tk-filters-main{grid-template-columns:repeat(3,minmax(120px,1fr))}"
+    "#page-tasks .tk-filters-main .span2{grid-column:span 2}}"
+    "@media(max-width:760px){#page-tasks .tk-filters-main{grid-template-columns:repeat(2,minmax(110px,1fr))}"
+    "#page-tasks .tk-tb-sep{display:none}}"
+)
+
+_TASKS_V1_JS = (
+    "function tasksToggleAdvanced(){const el=$('tk_filters_adv');const lbl=$('tk_adv_lbl');"
+    "const show=!!(el&&el.style.display==='none');if(el)el.style.display=show?'grid':'none';"
+    "if(lbl)lbl.textContent=show?'Ocultar avançados':'Mostrar avançados'}"
+    "function tasksBindFilterChips(){if(window._tkChipsBound)return;window._tkChipsBound=true;"
+    "['tf_mine','tf_overdue','tf_blocked','tf_show_done'].forEach(id=>{const el=$(id);if(!el||el.dataset.tkChipBound)return;"
+    "el.dataset.tkChipBound='1';el.addEventListener('change',()=>{saveTaskFilters();loadTasks()})})}"
+    "function tkFilterKpi(kind){const k=String(kind||'all');"
+    "if(k==='all'){clearTaskFilters();return}"
+    "if($('tf_q'))$('tf_q').value='';if($('tf_estado'))$('tf_estado').value='Todos';"
+    "if($('tf_prio'))$('tf_prio').value='Todos';if($('tf_resp'))$('tf_resp').value='Todos';"
+    "if($('tf_projeto'))$('tf_projeto').value='Todos';"
+    "if($('tf_mine'))$('tf_mine').checked=false;"
+    "if($('tf_overdue'))$('tf_overdue').checked=(k==='overdue');"
+    "if($('tf_blocked'))$('tf_blocked').checked=(k==='blocked');"
+    "if($('tf_show_done'))$('tf_show_done').checked=(k==='done');"
+    "if(k==='open'&&$('tf_show_done'))$('tf_show_done').checked=false;"
+    "saveTaskFilters();loadTasks()}"
+    "function _taskDaysToDue(r){if(typeof _taskIsDone==='function'&&_taskIsDone(r))return null;"
+    "const d=String(r?.Prazo||'').slice(0,10);if(!d)return null;"
+    "const t=new Date();t.setHours(0,0,0,0);const dt=new Date(d+'T00:00:00');if(isNaN(dt))return null;"
+    "return Math.floor((dt.getTime()-t.getTime())/86400000)}"
+    "function _taskIsRisk(r){if(typeof _taskIsDone==='function'&&_taskIsDone(r))return false;"
+    "const dd=_taskDaysToDue(r);return dd!=null&&dd>=0&&dd<=7}"
+    "function tasksUpdateFooter(){const rows=taskRows||[];const total=rows.length||0;"
+    "const pct=n=>total?Math.round(n*100/total):0;"
+    "const done=rows.filter(r=>typeof _taskIsDone==='function'?_taskIsDone(r):String(r?.Estado||'').trim().toLowerCase()==='concluído').length;"
+    "const overdue=rows.filter(r=>(typeof _taskIsDone==='function'?!_taskIsDone(r):true)&&!!r?.is_overdue).length;"
+    "const blocked=rows.filter(r=>Number(r?.blocked_count||0)>0).length;"
+    "const risk=rows.filter(r=>_taskIsRisk(r)).length;"
+    "const nodue=rows.filter(r=>!String(r?.Prazo||'').trim()).length;"
+    "const set=(id,v)=>{const el=$(id);if(el)el.textContent=v};"
+    "set('tk_f_overdue',overdue);set('tk_f_overdue_pct',pct(overdue)+'%');"
+    "set('tk_f_risk',risk);set('tk_f_risk_pct',pct(risk)+'%');"
+    "set('tk_f_done',done);set('tk_f_done_pct',pct(done)+'%');"
+    "set('tk_f_blocked',blocked);set('tk_f_blocked_pct',pct(blocked)+'%');"
+    "set('tk_f_nodue',nodue);set('tk_f_nodue_pct',pct(nodue)+'%');"
+    "const pp=pct(done);set('tk_prog_pct',pp+'%');const ring=$('tk_ring_fg');if(ring)ring.setAttribute('stroke-dasharray',pp+',100')}"
+    "function _taskRowAccent(r){const st=String(r?.Estado||'').trim().toLowerCase();"
+    "if(st==='concluído'||st==='concluido')return 'tk-row-done';"
+    "if((r?.blocked_count||0)>0)return 'tk-row-blocked';"
+    "if(r?.is_overdue)return 'tk-row-overdue';"
+    "if(st.includes('progress')||st.includes('curso'))return 'tk-row-progress';return ''}"
+    "function _taskIsDone(r){const st=String(r?.Estado||'').trim().toLowerCase();return st==='concluído'||st==='concluido'}"
+    "function _taskDueCell(r){const main=_taskDate(r?.Prazo);if(_taskIsDone(r))return `<div class=\"tk-due-main\">${main||'—'}</div>`;"
+    "const badge=r?.due_badge||{};const txt=String(badge.text||'').trim();"
+    "if(txt&&!txt.toLowerCase().includes('atras')){const cls='tk-due-sub tk-due-ok';"
+    "return `<div class=\"tk-due-main\">${main||'—'}</div><div class=\"${cls}\">${esc(txt)}</div>`}"
+    "if(txt&&txt.toLowerCase().includes('atras')){return `<div class=\"tk-due-main\">${main||'—'}</div><div class=\"tk-due-sub\">${esc(txt)}</div>`}"
+    "const dd=_taskDaysToDue(r);if(dd!=null&&dd<0){return `<div class=\"tk-due-main\">${main||'—'}</div><div class=\"tk-due-sub\">Atraso ${Math.abs(dd)}d</div>`}"
+    "return `<div class=\"tk-due-main\">${main||'—'}</div>`}"
+)
+
+_TE_BADGE_OLD = (
+    "function teBadge(e){let s=String(e||'').trim();if(!s)s='Não iniciado';let c='te';"
+    "if(s==='Concluído')c='te-done';else if(s==='Não iniciado'||s==='A Fazer')c='te-wait';"
+    "else if(s==='Em Progresso')c='te-prog';return `<span class=\"badge ${c}\">${esc(s)}</span>`}"
+)
+
+_TE_BADGE_NEW = (
+    "function teBadge(e){let s=String(e||'').trim();if(!s)s='Não iniciado';let c='tk-pill-wait';"
+    "if(s==='Concluído')c='tk-pill-done';else if(s==='Em Progresso')c='tk-pill-prog';"
+    "else if(s.toLowerCase().includes('bloque'))c='tk-pill-block';"
+    "return `<span class=\"tk-pill ${c}\">${esc(s)}</span>`}"
+)
+
+_TP_BADGE_OLD = (
+    "function tpBadge(p){const s=String(p||'');let c='tp-med';if(s==='Baixa')c='tp-low';"
+    "if(s==='Alta')c='tp-high';return `<span class=\"badge ${c}\">${esc(s)}</span>`}"
+)
+
+_TP_BADGE_NEW = (
+    "function tpBadge(p){const s=String(p||'');let c='tk-pill-prio-med';if(s==='Baixa')c='tk-pill-prio-low';"
+    "if(s==='Alta')c='tk-pill-prio-high';return `<span class=\"tk-pill ${c}\">${esc(s)}</span>`}"
+)
+
+_TASK_COL_CELL_PRAZO_OLD = (
+    "if(c==='DataRegisto'||c==='Prazo'||c==='InicioPrevisto')return `<td data-col=\"${c}\">${_taskDate(r[c])}</td>`;"
+)
+
+_TASK_COL_CELL_PRAZO_NEW = (
+    "if(c==='Prazo')return `<td data-col=\"${c}\">${_taskDueCell(r)}</td>`;"
+    "if(c==='DataRegisto'||c==='InicioPrevisto')return `<td data-col=\"${c}\">${_taskDate(r[c])}</td>`;"
+)
+
+_RENDER_TASKS_ROW_OLD = (
+    "taskRows.forEach(r=>{let tr=document.createElement('tr');if(taskSel===r.TaskID)tr.className='sel';if(r.is_overdue)tr.classList.add('row-overdue');"
+)
+
+_RENDER_TASKS_ROW_NEW = (
+    "taskRows.forEach(r=>{let tr=document.createElement('tr');const _acc=_taskRowAccent(r);"
+    "if(taskSel===r.TaskID)tr.className='sel';if(_acc)tr.classList.add(_acc);if(r.is_overdue)tr.classList.add('row-overdue');"
+)
+
+_LOAD_TASKS_FOOTER_OLD = (
+    "if(page==='tasks')$('upd').textContent='Última atualização: '+new Date().toLocaleTimeString('pt-PT')}catch(e){toast(e.message,true)}}"
+)
+
+_LOAD_TASKS_FOOTER_NEW = (
+    "tasksBindFilterChips();tasksLoadPagePrefs();tasksUpdateFooter();"
+    "if(page==='tasks')$('upd').textContent='Última atualização: '+new Date().toLocaleTimeString('pt-PT')}catch(e){toast(e.message,true)}}"
+)
+
+_TASKS_TABLE_PAGER_HTML = (
+    '<div class="tasks-pager" id="tasks-pager">'
+    '<span class="muted" id="tk_pager_info">0 tarefas</span>'
+    '<div class="tk-pager-controls">'
+    '<button type="button" class="btn" id="tk_pg_first" onclick="tasksSetPage(1)" disabled title="Primeira página">«</button>'
+    '<button type="button" class="btn" id="tk_pg_prev" onclick="tasksSetPage(_taskPage-1)" disabled title="Anterior">‹</button>'
+    '<span id="tk_pg_label" class="tk-pager-label">1 / 1</span>'
+    '<button type="button" class="btn" id="tk_pg_next" onclick="tasksSetPage(_taskPage+1)" disabled title="Seguinte">›</button>'
+    '<button type="button" class="btn" id="tk_pg_last" onclick="tasksSetPage(_taskPageLast)" disabled title="Última página">»</button>'
+    '<label class="tk-pager-size">Mostrar '
+    '<select id="tk_page_size" onchange="tasksSetPageSize(this.value)">'
+    '<option value="25">25</option><option value="50">50</option>'
+    '<option value="100">100</option><option value="0">Todas</option></select></label>'
+    "</div></div>"
+)
+
+_TASKS_TABLE_CARD_OLD = (
+    '<section class="card"><div class="table-wrap"><table><thead><tr><th></th>'
+    '<th class="sortable" onclick="sortTasks(\'TaskID\')">TaskID</th>'
+    '<th class="sortable" onclick="sortTasks(\'Tarefa\')">Tarefa</th><th>Notif.</th>'
+    '<th class="sortable" onclick="sortTasks(\'Notificacoes\')">Notificações</th>'
+)
+
+_TASKS_TABLE_CARD_NEW = (
+    '<section class="card tk-table-card">' + _TASKS_TABLE_PAGER_HTML + '<div class="table-wrap"><table><thead><tr><th></th>'
+    '<th class="sortable" onclick="sortTasks(\'TaskID\')">TaskID</th>'
+    '<th class="sortable" onclick="sortTasks(\'Tarefa\')">Tarefa</th><th>Notif.</th>'
+    '<th class="sortable" onclick="sortTasks(\'Notificacoes\')">Notificações</th>'
+)
+
+_TASKS_TOOLBAR_V2_OLD = _TASKS_TOOLBAR_NEW
+
+_TASKS_TOOLBAR_V2_NEW = (
+    '<div class="toolbar tk-toolbar">'
+    '<div class="tk-tb-group">'
+    '<button class="btn primary" id="tb_new" onclick="newTask()">＋ Nova</button>'
+    '<button class="btn" id="tb_edit" onclick="editTaskSel()" disabled>Editar</button>'
+    '<button class="btn" id="tb_dup" onclick="dupTaskSel()" disabled>Duplicar</button>'
+    '<button class="btn danger" id="tb_del" onclick="delTaskSel()" disabled>Apagar</button>'
+    "</div><div class=\"tk-tb-sep\"></div><div class=\"tk-tb-group\">"
+    '<button class="btn" onclick="openPortfolioGantt()">📊 Gantt</button>'
+    '<button class="btn" onclick="openTaskColsModal()">Colunas</button>'
+    '<button class="btn" onclick="taskColsAutoFit()">Auto-ajustar</button>'
+    '<button class="btn" id="tb_folder" onclick="openTaskFolderSel()" disabled>Abrir pasta</button>'
+    '<button class="btn" id="tb_link" onclick="openTaskLinkSel()" disabled>Abrir link</button>'
+    "</div><div class=\"tk-tb-sep\"></div><div class=\"tk-tb-group tk-tb-more-wrap\">"
+    '<button type="button" class="btn" onclick="tasksToggleMoreMenu(event)">Mais acções ▾</button>'
+    '<div class="tk-tb-menu" id="tk_tb_menu" style="display:none">'
+    '<button type="button" class="btn" onclick="exportTasksCsv();tasksCloseMoreMenu()">Exportar CSV</button>'
+    '<button type="button" class="btn" onclick="exportTasksXls();tasksCloseMoreMenu()">Exportar Excel</button>'
+    '<button type="button" class="btn" onclick="openExcelFiltersModal();tasksCloseMoreMenu()">Filtros Excel</button>'
+    '<button type="button" class="btn" onclick="openArchiveModal();tasksCloseMoreMenu()">Arquivo</button>'
+    "</div></div><span class=\"spacer\"></span>"
+    '<button class="btn" onclick="loadTasks()">Atualizar</button></div>'
+)
+
+_TASKS_V2_CSS = (
+    "#page-tasks .tk-table-card{padding-top:10px}"
+    "#page-tasks .tasks-pager{display:flex;align-items:center;justify-content:space-between;gap:12px;"
+    "flex-wrap:wrap;padding:0 12px 10px;border-bottom:1px solid #e5e7eb;margin-bottom:0}"
+    "#page-tasks .tk-pager-controls{display:flex;align-items:center;gap:6px;flex-wrap:wrap}"
+    "#page-tasks .tk-pager-label{min-width:56px;text-align:center;font-size:12px;font-weight:600;color:#334155}"
+    "#page-tasks .tk-pager-size{display:inline-flex;align-items:center;gap:6px;font-size:12px;color:#64748b;margin-left:4px}"
+    "#page-tasks .tk-pager-size select{padding:6px 8px;border-radius:8px;border:1px solid #d7dde8;background:#fff}"
+    "#page-tasks .tk-tb-more-wrap{position:relative}"
+    "#page-tasks .tk-tb-menu{position:absolute;top:calc(100% + 4px);left:0;z-index:30;display:none;"
+    "min-width:180px;padding:6px;background:#fff;border:1px solid #dbe3ee;border-radius:10px;"
+    "box-shadow:0 8px 24px rgba(15,23,42,.12);flex-direction:column;gap:4px}"
+    "#page-tasks .tk-tb-menu .btn{width:100%;justify-content:flex-start;text-align:left}"
+)
+
+_TASKS_V2_JS = (
+    "let _taskPage=1,_taskPageSize=25,_taskPageLast=1;"
+    "function tasksLoadPagePrefs(){if(window._tkPagePrefsLoaded)return;window._tkPagePrefsLoaded=true;"
+    "try{const v=localStorage.getItem('taskPageSize');if(v!=null){const n=Number(v);"
+    "if([25,50,100,0].includes(n)){_taskPageSize=n;const s=$('tk_page_size');if(s)s.value=String(n)}}}catch(_){}}"
+    "function tasksSavePageSize(){try{localStorage.setItem('taskPageSize',String(_taskPageSize))}catch(_){}}"
+    "function tasksResetPage(){_taskPage=1;tasksClampPage()}"
+    "function tasksClampPage(){const total=(taskRows||[]).length;const ps=Number(_taskPageSize||25);"
+    "_taskPageLast=(!ps||ps<=0)?1:Math.max(1,Math.ceil(total/ps)||1);"
+    "if(_taskPage>_taskPageLast)_taskPage=_taskPageLast;if(_taskPage<1)_taskPage=1}"
+    "function tasksPagerSlice(rows){const all=rows||[];tasksClampPage();const ps=Number(_taskPageSize||25);"
+    "if(!ps||ps<=0)return all;const start=(_taskPage-1)*ps;return all.slice(start,start+ps)}"
+    "function tasksUpdatePager(){tasksClampPage();const total=(taskRows||[]).length;const ps=Number(_taskPageSize||25);"
+    "const start=total?(ps&&ps>0?(_taskPage-1)*ps+1:1):0;const end=ps&&ps>0?Math.min(total,_taskPage*ps):total;"
+    "const info=$('tk_pager_info');if(info)info.textContent=total?(start+'–'+end+' de '+total):'0 tarefas';"
+    "const lbl=$('tk_pg_label');if(lbl)lbl.textContent=_taskPage+' / '+_taskPageLast;"
+    "const disFirst=_taskPage<=1;const disLast=_taskPage>=_taskPageLast||total===0;"
+    "['tk_pg_first','tk_pg_prev'].forEach(id=>{const b=$(id);if(b)b.disabled=disFirst});"
+    "['tk_pg_next','tk_pg_last'].forEach(id=>{const b=$(id);if(b)b.disabled=disLast})}"
+    "function tasksSetPage(n){tasksClampPage();const p=Math.max(1,Math.min(_taskPageLast,Number(n)||1));"
+    "if(p===_taskPage)return;_taskPage=p;renderTasks();"
+    "const wrap=$('trows')?.closest('.table-wrap');if(wrap)wrap.scrollTop=0}"
+    "function tasksSetPageSize(v){const n=Number(v);_taskPageSize=[25,50,100,0].includes(n)?n:25;"
+    "_taskPage=1;tasksSavePageSize();renderTasks()}"
+    "function tasksToggleMoreMenu(e){if(e){e.preventDefault();e.stopPropagation()}const m=$('tk_tb_menu');if(!m)return;"
+    "const open=m.style.display!=='none';m.style.display=open?'none':'flex';"
+    "if(!open){const close=ev=>{if(ev&&m.contains(ev.target))return;m.style.display='none';document.removeEventListener('click',close)};"
+    "setTimeout(()=>document.addEventListener('click',close),0)}}"
+    "function tasksCloseMoreMenu(){const m=$('tk_tb_menu');if(m)m.style.display='none'}"
+)
+
+_LOAD_TASKS_ROWS_OLD = "let _rows=(j.rows||[]);taskRows=_mineApplyRows(_rows);"
+
+_LOAD_TASKS_ROWS_NEW = (
+    "let _rows=(j.rows||[]);taskRows=_mineApplyRows(_rows);"
+    "if(typeof tasksResetPage==='function')tasksResetPage();"
+)
+
+_SORT_TASKS_RENDER_OLD = "});renderTasks();if(!silent)toast('Ordenado:"
+
+_SORT_TASKS_RENDER_NEW = "});if(typeof tasksClampPage==='function')tasksClampPage();renderTasks();if(!silent)toast('Ordenado:"
+
+_RENDER_SQL_LOOP_OLD = (
+    "const cols=_taskColsNormalize(_taskColsVisible);taskRows.forEach(r=>{let tr=document.createElement('tr');"
+    "if(taskSel===r.TaskID)tr.className='sel';if(r.is_overdue)tr.classList.add('row-overdue');"
+    "if((r.blocked_count||0)>0)tr.classList.add('row-blocked');"
+)
+
+_RENDER_SQL_LOOP_NEW = (
+    "const cols=_taskColsNormalize(_taskColsVisible);"
+    "const _pageRows=(typeof tasksPagerSlice==='function')?tasksPagerSlice(taskRows):taskRows;"
+    "_pageRows.forEach(r=>{let tr=document.createElement('tr');"
+    "const _acc=(typeof _taskRowAccent==='function')?_taskRowAccent(r):'';"
+    "if(taskSel===r.TaskID)tr.className='sel';if(_acc)tr.classList.add(_acc);if(r.is_overdue)tr.classList.add('row-overdue');"
+    "if((r.blocked_count||0)>0)tr.classList.add('row-blocked');"
+)
+
+_RENDER_SQL_PAGER_OLD = "tb.appendChild(tr)});const has=!!taskSel;if($('tb_edit'))"
+
+_RENDER_SQL_PAGER_NEW = (
+    "tb.appendChild(tr)});if(typeof tasksUpdatePager==='function')tasksUpdatePager();"
+    "const has=!!taskSel;if($('tb_edit'))"
+)
+
+
+def _patch_html_tasks_visual_v2(html: str) -> str:
+    if 'id="tasks-pager"' not in html and _TASKS_TABLE_CARD_OLD in html:
+        html = html.replace(_TASKS_TABLE_CARD_OLD, _TASKS_TABLE_CARD_NEW, 1)
+    if _TASKS_TOOLBAR_V2_OLD in html and _TASKS_TOOLBAR_V2_OLD != _TASKS_TOOLBAR_V2_NEW:
+        html = html.replace(_TASKS_TOOLBAR_V2_OLD, _TASKS_TOOLBAR_V2_NEW, 1)
+    if "#page-tasks .tasks-pager" not in html:
+        html = html.replace("</style>", _TASKS_V2_CSS + "</style>", 1)
+    if "function tasksPagerSlice" not in html:
+        marker = "function tasksToggleAdvanced()"
+        if marker in html:
+            html = html.replace(marker, _TASKS_V2_JS + marker, 1)
+    if _LOAD_TASKS_ROWS_OLD in html:
+        html = html.replace(_LOAD_TASKS_ROWS_OLD, _LOAD_TASKS_ROWS_NEW, 1)
+    if _SORT_TASKS_RENDER_OLD in html:
+        html = html.replace(_SORT_TASKS_RENDER_OLD, _SORT_TASKS_RENDER_NEW, 1)
+    if _RENDER_SQL_LOOP_OLD in html:
+        html = html.replace(_RENDER_SQL_LOOP_OLD, _RENDER_SQL_LOOP_NEW, 1)
+    if _RENDER_SQL_PAGER_OLD in html:
+        html = html.replace(_RENDER_SQL_PAGER_OLD, _RENDER_SQL_PAGER_NEW, 1)
+    return html
+
+
+def _patch_html_tasks_visual(html: str) -> str:
+    if _TASKS_KPIS_OLD in html:
+        html = html.replace(_TASKS_KPIS_OLD, _TASKS_KPIS_NEW, 1)
+    if _TASKS_FILTERS_OLD in html:
+        html = html.replace(_TASKS_FILTERS_OLD, _TASKS_FILTERS_NEW, 1)
+    if _TASKS_TOOLBAR_OLD in html:
+        html = html.replace(_TASKS_TOOLBAR_OLD, _TASKS_TOOLBAR_NEW, 1)
+    if 'id="tasks-footer"' not in html:
+        html = html.replace(
+            '</div></section></div><div id="page-task-detail"',
+            '</div></section>' + _TASKS_FOOTER_HTML + '</div><div id="page-task-detail"',
+            1,
+        )
+    if "#page-tasks .tk-kpis" not in html:
+        html = html.replace("</style>", _TASKS_V1_CSS + "</style>", 1)
+    if "function tasksToggleAdvanced()" not in html:
+        marker = "function _taskDate(v){return esc(String(v||'').slice(0,10))}"
+        if marker in html:
+            html = html.replace(marker, _TASKS_V1_JS + marker, 1)
+    if _TE_BADGE_OLD in html:
+        html = html.replace(_TE_BADGE_OLD, _TE_BADGE_NEW, 1)
+    if _TP_BADGE_OLD in html:
+        html = html.replace(_TP_BADGE_OLD, _TP_BADGE_NEW, 1)
+    if _TASK_COL_CELL_PRAZO_OLD in html:
+        html = html.replace(_TASK_COL_CELL_PRAZO_OLD, _TASK_COL_CELL_PRAZO_NEW, 1)
+    if _RENDER_TASKS_ROW_OLD in html:
+        html = html.replace(_RENDER_TASKS_ROW_OLD, _RENDER_TASKS_ROW_NEW, 1)
+    if _LOAD_TASKS_FOOTER_OLD in html:
+        html = html.replace(_LOAD_TASKS_FOOTER_OLD, _LOAD_TASKS_FOOTER_NEW, 1)
+    return _patch_html_tasks_visual_v3(_patch_html_tasks_visual_v2(html))
+
+
+_TASK_DUE_CELL_OLD = (
+    "function _taskDueCell(r){const main=_taskDate(r?.Prazo);"
+    "const badge=r?.due_badge||{};const txt=String(badge.text||'').trim();"
+    "if(txt){const cls=txt.toLowerCase().includes('atras')?'tk-due-sub':'tk-due-sub tk-due-ok';"
+    "return `<div class=\"tk-due-main\">${main||'—'}</div><div class=\"${cls}\">${esc(txt)}</div>`}"
+    "const dd=_taskDaysToDue(r);if(dd!=null&&dd<0){return `<div class=\"tk-due-main\">${main||'—'}</div><div class=\"tk-due-sub\">Atraso ${Math.abs(dd)}d</div>`}"
+    "return `<div class=\"tk-due-main\">${main||'—'}</div>`}"
+)
+
+_TASK_DUE_CELL_NEW = (
+    "function _taskIsDone(r){const st=String(r?.Estado||'').trim().toLowerCase();return st==='concluído'||st==='concluido'}"
+    "function _taskDueCell(r){const main=_taskDate(r?.Prazo);if(_taskIsDone(r))return `<div class=\"tk-due-main\">${main||'—'}</div>`;"
+    "const badge=r?.due_badge||{};const txt=String(badge.text||'').trim();"
+    "if(txt&&!txt.toLowerCase().includes('atras')){const cls='tk-due-sub tk-due-ok';"
+    "return `<div class=\"tk-due-main\">${main||'—'}</div><div class=\"${cls}\">${esc(txt)}</div>`}"
+    "if(txt&&txt.toLowerCase().includes('atras')){return `<div class=\"tk-due-main\">${main||'—'}</div><div class=\"tk-due-sub\">${esc(txt)}</div>`}"
+    "const dd=_taskDaysToDue(r);if(dd!=null&&dd<0){return `<div class=\"tk-due-main\">${main||'—'}</div><div class=\"tk-due-sub\">Atraso ${Math.abs(dd)}d</div>`}"
+    "return `<div class=\"tk-due-main\">${main||'—'}</div>`}"
+)
+
+_TASK_ROW_ACCENT_OLD = (
+    "function _taskRowAccent(r){if((r?.blocked_count||0)>0)return 'tk-row-blocked';"
+    "if(r?.is_overdue)return 'tk-row-overdue';"
+    "const st=String(r?.Estado||'').trim().toLowerCase();"
+    "if(st==='concluído'||st==='concluido')return 'tk-row-done';"
+    "if(st.includes('progress')||st.includes('curso'))return 'tk-row-progress';return ''}"
+)
+
+_TASK_ROW_ACCENT_NEW = (
+    "function _taskRowAccent(r){const st=String(r?.Estado||'').trim().toLowerCase();"
+    "if(st==='concluído'||st==='concluido')return 'tk-row-done';"
+    "if((r?.blocked_count||0)>0)return 'tk-row-blocked';"
+    "if(r?.is_overdue)return 'tk-row-overdue';"
+    "if(st.includes('progress')||st.includes('curso'))return 'tk-row-progress';return ''}"
+)
+
+_TASK_DAYS_DUE_OLD = (
+    "function _taskDaysToDue(r){const d=String(r?.Prazo||'').slice(0,10);if(!d)return null;"
+)
+
+_TASK_DAYS_DUE_NEW = (
+    "function _taskDaysToDue(r){if(typeof _taskIsDone==='function'&&_taskIsDone(r))return null;"
+    "const d=String(r?.Prazo||'').slice(0,10);if(!d)return null;"
+)
+
+_ROW_OVERDUE_OLD = "if(r.is_overdue)tr.classList.add('row-overdue');"
+
+_ROW_OVERDUE_NEW = "if(r.is_overdue&&!(typeof _taskIsDone==='function'?_taskIsDone(r):false))tr.classList.add('row-overdue');"
+
+_TASKS_KPIS_V3_OLD = (
+    '<div class="kpi kpi-click" onclick="tkFilterKpi(\'blocked\')" title="Filtrar bloqueadas">'
+    '<div class="ico">🚫</div><div><div class="muted">Bloqueadas</div>'
+    '<div class="v" id="tk_blocked">0</div><div class="muted db-sub">Com bloqueios</div></div></div>'
+    "</section>"
+)
+
+_TASKS_KPIS_V3_NEW = (
+    '<div class="kpi kpi-click" onclick="tkFilterKpi(\'blocked\')" title="Filtrar bloqueadas">'
+    '<div class="ico">🚫</div><div><div class="muted">Bloqueadas</div>'
+    '<div class="v" id="tk_blocked">0</div><span class="tk-trend" id="tk_tr_blocked"></span>'
+    '<div class="muted db-sub">Com bloqueios</div></div></div>'
+    '<div class="kpi kpi-click" onclick="tkOpenAchImpact()" title="Conquistas das tarefas filtradas">'
+    '<div class="ico">📈</div><div><div class="muted">Impacto €</div>'
+    '<div class="v" id="tk_impact">€0</div><div class="muted db-sub" id="tk_impact_sub">Conquistas ligadas</div></div></div>'
+    "</section>"
+)
+
+_APP_TOP_OLD = (
+    '<div class="top"><b>App Engenharia Electronics — Web UI Local</b><span id="ver" class="muted"></span></div>'
+)
+
+_APP_TOP_NEW = (
+    '<div class="top app-top"><b>App Engenharia Electronics — Web UI Local</b>'
+    '<div class="app-top-tools">'
+    '<input id="global_q" class="app-top-search" placeholder="Pesquisa rápida (Enter)..." '
+    'onkeydown="if(event.key===\'Enter\')globalQuickSearch()">'
+    '<button type="button" class="btn" onclick="globalQuickSearch()" title="Pesquisar">🔎</button>'
+    '<button type="button" class="btn" id="btn_theme" onclick="toggleAppTheme()" title="Alternar tema">🌓</button>'
+    "</div><span id=\"ver\" class=\"muted\"></span></div>"
+)
+
+_TASKS_V3_CSS = (
+    "#page-tasks .tk-kpis{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:10px}"
+    "#page-tasks .tk-trend{display:inline-block;margin-left:6px;font-size:11px;font-weight:700;vertical-align:middle}"
+    "#page-tasks .tk-trend.up{color:#16a34a}#page-tasks .tk-trend.down{color:#dc2626}#page-tasks .tk-trend.flat{color:#94a3b8}"
+    ".app-top{display:flex;align-items:center;gap:12px;flex-wrap:wrap;padding:10px 16px;border-bottom:1px solid #e5e7eb;background:#fff}"
+    ".app-top-tools{display:flex;align-items:center;gap:8px;margin-left:auto;flex:1;justify-content:flex-end;max-width:520px}"
+    ".app-top-search{flex:1;min-width:160px;padding:8px 10px;border-radius:8px;border:1px solid #d7dde8;background:#fff}"
+    "body.theme-dark{background:#0f172a;color:#e2e8f0}"
+    "body.theme-dark .main{background:#0f172a}"
+    "body.theme-dark .top,body.theme-dark .card,body.theme-dark .content{background:#1e293b;color:#e2e8f0;border-color:#334155}"
+    "body.theme-dark .app-top-search,body.theme-dark select,body.theme-dark input{background:#0f172a;color:#e2e8f0;border-color:#475569}"
+    "@media(max-width:1400px){#page-tasks .tk-kpis{grid-template-columns:repeat(3,minmax(0,1fr))}}"
+    "@media(max-width:760px){#page-tasks .tk-kpis{grid-template-columns:repeat(2,minmax(0,1fr))}.app-top-tools{max-width:none;width:100%;margin-left:0}}"
+)
+
+_TASKS_V3_JS = (
+    "function tkOpenAchImpact(){if(typeof dbOpenAchievements==='function')dbOpenAchievements()}"
+    "function tasksEnsureTrendSlots(){"
+    "[['tk_total','tk_tr_total'],['tk_open','tk_tr_open'],['tk_done','tk_tr_done'],"
+    "['tk_overdue','tk_tr_overdue'],['tk_blocked','tk_tr_blocked']].forEach(([vid,tid])=>{"
+    "const v=$(vid),t=$(tid);if(!v||t)return;const s=document.createElement('span');"
+    "s.className='tk-trend';s.id=tid;v.insertAdjacentElement('afterend',s)})}"
+    "function tasksTrendHtml(cur,prev){const d=Number(cur||0)-Number(prev||0);"
+    "if(!Number.isFinite(d)||prev==null||prev===undefined)return '';"
+    "if(!d)return '<span class=\"tk-trend flat\">→</span>';"
+    "const cls=d>0?'up':'down';return `<span class=\"tk-trend ${cls}\">${d>0?'+':''}${d}</span>`}"
+    "function tasksUpdateTrends(k){tasksEnsureTrendSlots();let prev=null;"
+    "try{prev=JSON.parse(localStorage.getItem('tasksKpiPrev')||'null')}catch(_){}"
+    "const p=prev&&prev.k?prev.k:null;"
+    "const set=(id,v)=>{const el=$(id);if(el)el.innerHTML=v};"
+    "set('tk_tr_total',tasksTrendHtml(k.total,p?.total));set('tk_tr_open',tasksTrendHtml(k.open,p?.open));"
+    "set('tk_tr_done',tasksTrendHtml(k.done,p?.done));set('tk_tr_overdue',tasksTrendHtml(k.overdue,p?.overdue));"
+    "set('tk_tr_blocked',tasksTrendHtml(k.blocked,p?.blocked));"
+    "try{localStorage.setItem('tasksKpiPrev',JSON.stringify({ts:Date.now(),k}))}catch(_){}}"
+    "async function tasksLoadExtras(){try{"
+    "const p=tqs();if($('tf_mine')?.checked)p.delete('only_mine');"
+    "let j=await api('/api/tasks/extras?'+p);"
+    "if($('tk_impact'))$('tk_impact').textContent=money(j.impact_eur||0);"
+    "if($('tk_impact_sub'))$('tk_impact_sub').textContent=String(j.impact_label||'Conquistas ligadas')}catch(_){}}"
+    "function globalQuickSearch(){const q=String($('global_q')?.value||'').trim();"
+    "if(page==='tasks'){if($('tf_q'))$('tf_q').value=q;loadTasks();return}"
+    "showPage('tasks');ensureTaskLookups().then(()=>{if($('tf_q'))$('tf_q').value=q;loadTasks()})}"
+    "function toggleAppTheme(){const b=document.body;const dark=b.classList.toggle('theme-dark');"
+    "try{localStorage.setItem('uiTheme',dark?'dark':'light')}catch(_){}}"
+    "function initAppTheme(){try{const t=localStorage.getItem('uiTheme');"
+    "if(t==='dark')document.body.classList.add('theme-dark')}catch(_){}}"
+)
+
+_LOAD_TASKS_EXTRAS_OLD = "tasksBindFilterChips();tasksLoadPagePrefs();tasksUpdateFooter();"
+
+_LOAD_TASKS_EXTRAS_NEW = (
+    "tasksBindFilterChips();tasksLoadPagePrefs();tasksUpdateFooter();tasksUpdateTrends(k);tasksLoadExtras();"
+)
+
+
+_TASKS_ENSURE_TRENDS_OLD = (
+    "const v=$(vid),t=$(tid);if(!v||t)return;if(!t.parentElement){const s=document.createElement('span');"
+    "s.className='tk-trend';s.id=tid;v.insertAdjacentElement('afterend',s)}})}"
+)
+
+_TASKS_ENSURE_TRENDS_NEW = (
+    "const v=$(vid),t=$(tid);if(!v||t)return;const s=document.createElement('span');"
+    "s.className='tk-trend';s.id=tid;v.insertAdjacentElement('afterend',s)})}"
+)
+
+
+def _patch_html_tasks_visual_v3(html: str) -> str:
+    if _TASKS_ENSURE_TRENDS_OLD in html:
+        html = html.replace(_TASKS_ENSURE_TRENDS_OLD, _TASKS_ENSURE_TRENDS_NEW, 1)
+    if _TASK_DUE_CELL_OLD in html and _TASK_DUE_CELL_NEW not in html:
+        html = html.replace(_TASK_DUE_CELL_OLD, _TASK_DUE_CELL_NEW, 1)
+    if _TASK_ROW_ACCENT_OLD in html:
+        html = html.replace(_TASK_ROW_ACCENT_OLD, _TASK_ROW_ACCENT_NEW, 1)
+    if _TASK_DAYS_DUE_OLD in html:
+        html = html.replace(_TASK_DAYS_DUE_OLD, _TASK_DAYS_DUE_NEW, 1)
+    if _ROW_OVERDUE_OLD in html:
+        html = html.replace(_ROW_OVERDUE_OLD, _ROW_OVERDUE_NEW, 1)
+    if 'id="tk_impact"' not in html and _TASKS_KPIS_V3_OLD in html:
+        html = html.replace(_TASKS_KPIS_V3_OLD, _TASKS_KPIS_V3_NEW, 1)
+    if _APP_TOP_OLD in html and "app-top-tools" not in html:
+        html = html.replace(_APP_TOP_OLD, _APP_TOP_NEW, 1)
+    if "#page-tasks .tk-trend" not in html:
+        html = html.replace("</style>", _TASKS_V3_CSS + "</style>", 1)
+    if "function tasksLoadExtras" not in html:
+        marker = "function tasksToggleAdvanced()"
+        if marker in html:
+            html = html.replace(marker, _TASKS_V3_JS + marker, 1)
+    if _LOAD_TASKS_EXTRAS_OLD in html:
+        html = html.replace(_LOAD_TASKS_EXTRAS_OLD, _LOAD_TASKS_EXTRAS_NEW, 1)
+    if "initAppTheme();" not in html and "bindNav();" in html:
+        html = html.replace("bindNav();", "bindNav();initAppTheme();", 1)
+    html = html.replace(
+        '<label class="tk-chip"><input type="checkbox" id="tf_show_done"> Ver concluídas</label>',
+        '<label class="tk-chip"><input type="checkbox" id="tf_show_done"> Concluídas</label>',
+    )
+    html = html.replace(
+        '<label style="padding-top:30px"><input type="checkbox" id="tf_show_done" onchange="loadTasks()"> Ver concluídas</label>',
+        '<label style="padding-top:30px"><input type="checkbox" id="tf_show_done" onchange="loadTasks()"> Concluídas</label>',
     )
     return html
 
@@ -1737,7 +2895,9 @@ def _patch_html_dashboard(html: str) -> str:
         "function dbQs(){const q=new URLSearchParams();q.set('mode',$('db_mode')?.value||'executivo');[['estado','db_estado_f','Todos'],['prioridade','db_prio_f','Todos'],['responsavel','db_resp_f','Todos'],['projeto','db_proj_f','Todos']].forEach(([k,id,d])=>{const v=$(id)?.value;if(v&&v!==d)q.set(k,v)});if($('db_only_open')?.checked)q.set('only_open','1');return '?'+q.toString()}"
         "function dbApplyTaskFilters(extra={}){if($('tf_q'))$('tf_q').value='';if($('tf_estado'))$('tf_estado').value=extra.estado||'Todos';if($('tf_prio'))$('tf_prio').value=extra.prioridade||'Todos';if($('tf_resp'))$('tf_resp').value=extra.responsavel||'Todos';if($('tf_projeto'))$('tf_projeto').value=extra.projeto||'Todos';"
         "if($('tf_overdue'))$('tf_overdue').checked=!!extra.overdue;if($('tf_blocked'))$('tf_blocked').checked=!!extra.blocked;"
-        "if(extra.open_only)window._dash_open_only=true}"
+        "if($('tf_show_done'))$('tf_show_done').checked=!!extra.show_done;"
+        "if(extra.open_only&&$('tf_show_done'))$('tf_show_done').checked=false;"
+        "if(extra.open_only)window._dash_open_only=false}"
         "function dbOpenTasksWith(extra={}){showPage('tasks');ensureTaskLookups().then(()=>{dbApplyTaskFilters(extra||{});loadTasks()})}"
         "function dbOpenAchievements(){showPage('ach');setTimeout(()=>{if(typeof loadAll==='function')loadAll()},0)}"
         "function dbOpenAchievementImpact(){dbOpenAchievements()}"
@@ -1760,6 +2920,204 @@ def _patch_html_dashboard(html: str) -> str:
         html,
         count=1,
     )
+    return html
+
+
+_BOARD_FILTERS_OLD = (
+    '<section class="card filters"><div class="field"><label>Estado</label><select id="bf_estado" onchange="loadBoard()"><option>Todos</option></select></div>'
+    '<div class="field"><label>Prioridade</label><select id="bf_prio" onchange="loadBoard()"><option>Todas</option></select></div>'
+    '<div class="field"><label>Responsável</label><select id="bf_resp" onchange="loadBoard()"><option>Todos</option></select></div>'
+    '<div class="field"><label>Projeto</label><select id="bf_proj" onchange="loadBoard()"><option>Todos</option></select></div>'
+    '<div class="field span2"><label>Pesquisar</label><input id="bf_q" placeholder="ID, título, descrição..." '
+    'oninput="clearTimeout(window.bfq);window.bfq=setTimeout(loadBoard,250)"></div></section>'
+)
+
+_BOARD_FILTERS_NEW = (
+    '<section class="card filters board-filters" style="padding:12px">'
+    '<div class="grid board-grid">'
+    '<div class="field"><label>Estado</label><select id="bf_estado"><option>Todos</option></select></div>'
+    '<div class="field"><label>Prioridade</label><select id="bf_prio"><option>Todas</option></select></div>'
+    '<div class="field"><label>Responsável</label><select id="bf_resp"><option>Todos</option></select></div>'
+    '<div class="field"><label>Projeto</label><select id="bf_proj"><option>Todos</option></select></div>'
+    '<div class="field span2"><label>Pesquisar</label><input id="bf_q" placeholder="ID, título, descrição..."></div>'
+    '<div class="field board-quick"><label>Filtros rápidos</label>'
+    '<div class="board-chips">'
+    '<label class="board-chip"><input type="checkbox" id="bf_mine"> Minhas</label>'
+    '<label class="board-chip"><input type="checkbox" id="bf_overdue"> Atrasadas</label>'
+    '<label class="board-chip"><input type="checkbox" id="bf_blocked"> Bloqueadas</label>'
+    '<label class="board-chip"><input type="checkbox" id="bf_show_done"> Ver concluídas</label>'
+    "</div></div>"
+    '<div class="field board-apply"><button class="btn" type="button" onclick="boardClearFilters()">Limpar</button></div>'
+    "</div></section>"
+)
+
+_BOARD_CSS = (
+    "#page-board .board-grid{display:grid;grid-template-columns:repeat(6,minmax(120px,1fr));gap:10px;align-items:end}"
+    "#page-board .board-grid .field{margin:0;min-width:0}"
+    "#page-board .board-grid .span2{grid-column:span 2}"
+    "#page-board .board-quick{grid-column:1/-1}"
+    "#page-board .board-chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:4px}"
+    "#page-board .board-chip{display:inline-flex;align-items:center;gap:6px;padding:6px 10px;border-radius:999px;"
+    "background:#f1f5f9;border:1px solid #dbe3ee;font-size:12px;cursor:pointer;user-select:none}"
+    "#page-board .board-chip input{margin:0}"
+    "#page-board .board-apply{display:flex;justify-content:flex-end;align-items:end}"
+    "#page-board .k-card{border:1px solid #dbe3ee;border-radius:10px;padding:10px;background:#fff;margin-bottom:8px;"
+    "box-shadow:0 1px 2px rgba(15,23,42,.05);transition:box-shadow .12s ease,transform .08s ease}"
+    "#page-board .k-card:hover{box-shadow:0 4px 14px rgba(8,105,216,.10)}"
+    "#page-board .k-card-overdue{border-color:#fecaca;background:#fff7f7}"
+    "#page-board .k-card-blocked{border-color:#fca5a5;background:#fff5f5}"
+    "#page-board .k-badges{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}"
+    "#page-board .k-badge{display:inline-flex;align-items:center;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600}"
+    "#page-board .k-badge-block{background:#fee2e2;color:#991b1b}"
+    "#page-board .k-due{display:inline-flex;align-items:center;padding:2px 8px;border-radius:999px;font-size:11px;font-weight:600;margin-top:6px}"
+    "@media(max-width:1200px){#page-board .board-grid{grid-template-columns:repeat(3,minmax(120px,1fr))}"
+    "#page-board .board-grid .span2{grid-column:span 2}}"
+    "@media(max-width:760px){#page-board .board-grid{grid-template-columns:repeat(2,minmax(110px,1fr))}}"
+)
+
+_BOARD_JS = (
+    "let _boardPrefsLoaded=false,_boardFiltersSaveTimer=null;"
+    "function boardReadFilters(){return{"
+    "estado:$('bf_estado')?.value||'Todos',prioridade:$('bf_prio')?.value||'Todas',"
+    "responsavel:$('bf_resp')?.value||'Todos',projeto:$('bf_proj')?.value||'Todos',"
+    "q:($('bf_q')?.value||'').trim(),only_mine:!!$('bf_mine')?.checked,"
+    "overdue_only:!!$('bf_overdue')?.checked,blocked_only:!!$('bf_blocked')?.checked,"
+    "show_done:!!$('bf_show_done')?.checked};}"
+    "function boardApplyFiltersObj(o){if(!o||typeof o!=='object')return;"
+    "if($('bf_estado'))$('bf_estado').value=o.estado||'Todos';"
+    "if($('bf_prio'))$('bf_prio').value=o.prioridade||'Todas';"
+    "if($('bf_resp'))$('bf_resp').value=o.responsavel||'Todos';"
+    "if($('bf_proj'))$('bf_proj').value=o.projeto||'Todos';"
+    "if($('bf_q'))$('bf_q').value=o.q||'';"
+    "if($('bf_mine'))$('bf_mine').checked=!!o.only_mine;"
+    "if($('bf_overdue'))$('bf_overdue').checked=!!o.overdue_only;"
+    "if($('bf_blocked'))$('bf_blocked').checked=!!o.blocked_only;"
+    "if($('bf_show_done'))$('bf_show_done').checked=!!o.show_done;}"
+    "function boardSavePrefs(){try{clearTimeout(_boardFiltersSaveTimer);"
+    "_boardFiltersSaveTimer=setTimeout(async()=>{try{await api('/api/board/prefs',{method:'POST',body:JSON.stringify(boardReadFilters())})}catch(_){}},280)}catch(_){}}"
+    "function boardSavePrefsSilent(){try{clearTimeout(_boardFiltersSaveTimer);"
+    "_boardFiltersSaveTimer=setTimeout(async()=>{try{await api('/api/board/prefs',{method:'POST',body:JSON.stringify(boardReadFilters())})}catch(_){}},80)}catch(_){}}"
+    "async function loadBoardPrefs(){if(_boardPrefsLoaded)return;try{"
+    "let j=await api('/api/board/prefs');let o=(j&&j.prefs)||{};"
+    "if(!o||!Object.keys(o).length){try{const raw=localStorage.getItem('boardFilters');if(raw)o=JSON.parse(raw)||{}}catch(_){}}"
+    "boardApplyFiltersObj(o);if(o&&Object.keys(o).length)boardSavePrefsSilent();"
+    "}catch(_){}_boardPrefsLoaded=true;}"
+    "function boardClearFilters(){boardApplyFiltersObj({estado:'Todos',prioridade:'Todas',responsavel:'Todos',projeto:'Todos',q:'',only_mine:false,overdue_only:false,blocked_only:false,show_done:false});boardSavePrefs();loadBoard();}"
+    "function boardQs(){const q=new URLSearchParams();const f=boardReadFilters();"
+    "[['estado',f.estado,'Todos'],['prioridade',f.prioridade,'Todas'],['responsavel',f.responsavel,'Todos'],['projeto',f.projeto,'Todos']].forEach(([k,v,d])=>{if(v&&v!==d)q.set(k,v)});"
+    "if(f.q)q.set('q',f.q);if(f.only_mine)q.set('only_mine','1');if(f.overdue_only)q.set('overdue_only','1');"
+    "if(f.blocked_only)q.set('blocked_only','1');if(f.show_done)q.set('show_done','1');"
+    "const s=q.toString();return s?('?'+s):'';}"
+    "function saveBoardFilters(){boardSavePrefs();}"
+    "function restoreBoardFilters(){}"
+    "async function loadBoard(){try{await ensureTaskLookups();populateBoardFilters();await loadBoardPrefs();"
+    "let j=await api('/api/board'+boardQs());renderBoard(j);boardSavePrefs();"
+    "if(page==='board')$('upd').textContent='Última atualização: '+new Date().toLocaleTimeString('pt-PT')}catch(e){toast(e.message,true)}}"
+    "function populateBoardFilters(){const tl=_taskLookups||{};const prep=(a,d)=>[d,...new Set((a||[]).filter(x=>x&&x!==d))];"
+    "if($('bf_estado')&&!$('bf_estado').dataset.filled){fill('bf_estado',prep(tl.estados,'Todos'));fill('bf_prio',prep(tl.prioridades,'Todas'));"
+    "fill('bf_resp',prep(tl.users,'Todos'));fill('bf_proj',prep(tl.projects,'Todos'));$('bf_estado').dataset.filled='1';"
+    "['bf_estado','bf_prio','bf_resp','bf_proj','bf_mine','bf_overdue','bf_blocked','bf_show_done'].forEach(id=>{const el=$(id);if(!el||el.dataset.bfBound)return;"
+    "el.dataset.bfBound='1';el.addEventListener('change',()=>{boardSavePrefs();loadBoard()})});"
+    "const bq=$('bf_q');if(bq&&!bq.dataset.bfBound){bq.dataset.bfBound='1';bq.addEventListener('input',()=>{clearTimeout(window.bfq);window.bfq=setTimeout(()=>{boardSavePrefs();loadBoard()},250)})}}}"
+    "function renderBoard(j){const box=$('board_cols');if(!box)return;box.innerHTML='';const canEdit=canEditTasks();"
+    "(j.columns||[]).forEach(col=>{const wrap=document.createElement('div');wrap.className='k-col';wrap.style.background=col.color||'#f8fafc';"
+    "const cards=(j.cards&&j.cards[col.key])||[];wrap.innerHTML=`<div class=\"k-col-head\"><span>${esc(col.label)}</span><span class=\"badge\">${(j.counts&&j.counts[col.key])||cards.length}</span></div><div class=\"k-col-body\"></div>`;"
+    "const body=wrap.querySelector('.k-col-body');if(!cards.length)body.innerHTML='<p class=\"muted\" style=\"font-size:12px;text-align:center;padding:20px 0\">Sem tarefas</p>';"
+    "else cards.forEach(r=>{const card=document.createElement('div');const blocked=!!(r.is_blocked||(r.blocked_count||0)>0);"
+    "card.className='k-card'+(r.is_overdue?' k-card-overdue':'')+(blocked?' k-card-blocked':'');card.draggable=canEdit;card.dataset.tid=r.TaskID;"
+    "const due=r.due_badge||{};const badges=[];"
+    "if(due.text)badges.push(`<span class=\"k-badge k-due\" style=\"background:${due.bg};color:${due.fg}\">${esc(due.text)}</span>`);"
+    "if(blocked)badges.push(`<span class=\"k-badge k-badge-block\">🚫 Bloqueio${(r.blocked_count||0)>1?' ('+r.blocked_count+')':''}</span>`);"
+    "const badgeHtml=badges.length?`<div class=\"k-badges\">${badges.join('')}</div>`:'';"
+    "const bits=[r.Responsavel&&`Resp: ${esc(r.Responsavel)}`,r.Prioridade&&`Prio: ${esc(r.Prioridade)}`,r.Projeto&&`Proj: ${esc(r.Projeto)}`].filter(Boolean).join(' | ');"
+    "card.innerHTML=`<div><b>${esc(fmtTid(r.TaskID))}</b> — ${esc(r.Tarefa||'')}</div>${bits?`<div class=\"muted\" style=\"font-size:12px;margin-top:4px\">${bits}</div>`:''}${badgeHtml}"
+    "${(r.NotifEmoji||r.Notificacoes)?`<div style=\"margin-top:4px\">${esc(r.NotifEmoji||r.Notificacoes)}</div>`:''}"
+    "<div style=\"margin-top:8px;display:flex;gap:6px;flex-wrap:wrap;align-items:center\"><button class=\"btn\" style=\"font-size:12px;padding:4px 8px\" type=\"button\">Abrir</button>"
+    "<select class=\"k-status-sel\" style=\"font-size:12px;padding:4px 6px;border-radius:6px;border:1px solid #d7dde8\"></select></div>`;"
+    "card.querySelector('button').onclick=(e)=>{e.stopPropagation();openTaskDetail(r.TaskID)};const ksel=card.querySelector('.k-status-sel');"
+    "if(ksel&&canEdit){(j.columns||[]).forEach(c=>{const o=document.createElement('option');o.value=c.key;o.textContent=c.label;if((r.column||'')===c.key)o.selected=true;ksel.appendChild(o)});"
+    "ksel.onclick=e=>e.stopPropagation();ksel.onchange=async(e)=>{e.stopPropagation();const nv=ksel.value;if(nv===(r.column||''))return;"
+    "if(typeof validateTaskCanComplete==='function'&&!await validateTaskCanComplete(nv,r.TaskID)){ksel.value=r.column||'';return}"
+    "try{await api('/api/board/move',{method:'POST',body:JSON.stringify({task_id:r.TaskID,estado:nv})});toast('Estado: '+nv);loadBoard()}catch(err){toast(err.message,true);ksel.value=r.column||''}}}"
+    "if(canEdit){card.addEventListener('dragstart',e=>{_boardDragTid=r.TaskID;card.classList.add('dragging');e.dataTransfer.setData('text/plain',r.TaskID)});"
+    "card.addEventListener('dragend',()=>{card.classList.remove('dragging');_boardDragTid=null})}body.appendChild(card)});"
+    "if(canEdit){wrap.addEventListener('dragover',e=>{e.preventDefault();wrap.classList.add('drag-over')});wrap.addEventListener('dragleave',()=>wrap.classList.remove('drag-over'));"
+    "wrap.addEventListener('drop',async e=>{e.preventDefault();wrap.classList.remove('drag-over');const tid=e.dataTransfer.getData('text/plain')||_boardDragTid;if(!tid)return;"
+    "const cur=(cards.find(c=>c.TaskID===tid)||{}).column;if(cur===col.key)return;"
+    "if(typeof validateTaskCanComplete==='function'&&!await validateTaskCanComplete(col.key,tid))return;"
+    "try{await api('/api/board/move',{method:'POST',body:JSON.stringify({task_id:tid,estado:col.key})});"
+    "toast('Estado atualizado');loadBoard()}catch(err){toast(err.message,true)}})}box.appendChild(wrap)})}"
+)
+
+_BOARD_JS_OLD = (
+    "const BOARD_FILTERS_KEY='boardFilters';const TASK_FILTERS_KEY='taskFilters';"
+    "function saveBoardFilters(){try{const o={estado:$('bf_estado')?.value,prioridade:$('bf_prio')?.value,responsavel:$('bf_resp')?.value,projeto:$('bf_proj')?.value,q:$('bf_q')?.value};localStorage.setItem(BOARD_FILTERS_KEY,JSON.stringify(o))}catch(e){}}"
+    "function restoreBoardFilters(){try{const raw=localStorage.getItem(BOARD_FILTERS_KEY);if(!raw)return;const o=JSON.parse(raw)||{};if(o.estado&&$('bf_estado'))$('bf_estado').value=o.estado;if(o.prioridade&&$('bf_prio'))$('bf_prio').value=o.prioridade;if(o.responsavel&&$('bf_resp'))$('bf_resp').value=o.responsavel;if(o.projeto&&$('bf_proj'))$('bf_proj').value=o.projeto;if(o.q&&$('bf_q'))$('bf_q').value=o.q}catch(e){}}"
+)
+
+
+_BOARD_JS_OLD_BOARDQS = (
+    "function boardQs(){const q=new URLSearchParams();[['estado','bf_estado','Todos'],['prioridade','bf_prio','Todas'],"
+    "['responsavel','bf_resp','Todos'],['projeto','bf_proj','Todos']].forEach(([k,id,d])=>{const v=$(id)?.value;if(v&&v!==d)q.set(k,v)});"
+    "const t=$('bf_q')?.value?.trim();if(t)q.set('q',t);const s=q.toString();return s?('?'+s):''}"
+)
+
+
+def _patch_html_board(html: str) -> str:
+    if _BOARD_FILTERS_OLD not in html:
+        raise RuntimeError("Bytecode HTML inesperado — não foi possível aplicar patch board Fase A")
+    html = html.replace(_BOARD_FILTERS_OLD, _BOARD_FILTERS_NEW, 1)
+    if "#page-board .board-grid{" not in html:
+        html = html.replace("</style>", _BOARD_CSS + "</style>", 1)
+    if _BOARD_JS_OLD in html:
+        html = html.replace(_BOARD_JS_OLD, "", 1)
+    if _BOARD_JS_OLD_BOARDQS in html:
+        html = html.replace(_BOARD_JS_OLD_BOARDQS, "", 1)
+    html = re.sub(
+        r"function boardQs\(\)\{const q=new URLSearchParams\(\);\[\['estado','bf_estado','Todos'\],[\s\S]*?return s\?\('\?\+s\):''\}",
+        "",
+        html,
+        count=1,
+    )
+    html = re.sub(
+        r"async function loadBoard\(\)\{[\s\S]*?\}catch\(e\)\{toast\(e\.message,true\)\}\}",
+        "",
+        html,
+        count=1,
+    )
+    html = re.sub(
+        r"function populateBoardFilters\(\)\{[\s\S]*?\}\}\}",
+        "",
+        html,
+        count=1,
+    )
+    html = re.sub(
+        r"function renderBoard\(j\)\{[\s\S]*?box\.appendChild\(wrap\)\}\)\}",
+        "",
+        html,
+        count=1,
+    )
+    marker = "let _boardDragTid=null;"
+    if marker not in html:
+        raise RuntimeError("Bytecode HTML inesperado — anchor board JS em falta")
+    if "function boardReadFilters()" not in html:
+        html = html.replace(marker, marker + _BOARD_JS, 1)
+    if "validateTaskCanComplete(nv,r.TaskID)" not in html:
+        html = html.replace(
+            "const nv=ksel.value;if(nv===(r.column||''))return;try{await api('/api/board/move'",
+            "const nv=ksel.value;if(nv===(r.column||''))return;"
+            "if(typeof validateTaskCanComplete==='function'&&!await validateTaskCanComplete(nv,r.TaskID)){ksel.value=r.column||'';return}"
+            "try{await api('/api/board/move'",
+            1,
+        )
+    if "validateTaskCanComplete(col.key,tid)" not in html:
+        html = html.replace(
+            "if(cur===col.key)return;try{await api('/api/board/move',{method:'POST',body:JSON.stringify({task_id:tid,estado:col.key})});",
+            "if(cur===col.key)return;"
+            "if(typeof validateTaskCanComplete==='function'&&!await validateTaskCanComplete(col.key,tid))return;"
+            "try{await api('/api/board/move',{method:'POST',body:JSON.stringify({task_id:tid,estado:col.key})});",
+            1,
+        )
     return html
 
 
@@ -1843,26 +3201,23 @@ _SYSTEM_LISTS_JS = (
 )
 
 _ADMIN_HEAVY_HTML = (
-    '<section class="card" style="padding:16px;margin-bottom:14px">'
+    '<section class="card adm2-panel" id="adm2_panel_db" style="padding:16px;margin-bottom:12px;display:none">'
     '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">'
     '<h3 style="margin:0">Administração DB</h3>'
     '<div style="display:flex;gap:8px;flex-wrap:wrap">'
-    '<button class="btn" type="button" onclick="loadAdminAll()">Atualizar admin</button>'
+    '<button class="btn" type="button" onclick="loadAdminAll()">Atualizar</button>'
     '<button class="btn" type="button" onclick="adminRunBackup()">Backup lógico</button>'
     '<button class="btn" type="button" onclick="adminRunCleanup()">Limpeza</button>'
     "</div></div>"
     '<div class="field" style="margin-top:10px"><label>Visão geral</label>'
     '<pre id="adm_overview" class="muted" style="max-height:160px;overflow:auto">Sem dados.</pre></div>'
-    '<div class="field"><label>Arquivos (admin)</label>'
+    '<div class="field"><label>Arquivos</label>'
     '<div class="table-wrap"><table><thead><tr><th>ID</th><th>TaskID</th><th>Ação</th><th>User</th><th>TS</th><th>Ações</th></tr></thead>'
     '<tbody id="adm_archives"></tbody></table></div></div>'
     '<div class="field"><label>Sessões (últimas)</label>'
     '<pre id="adm_sessions" class="muted" style="max-height:140px;overflow:auto">Sem dados.</pre></div>'
     '<div class="field"><label>Logs app (tail)</label>'
     '<pre id="adm_logs" class="muted" style="max-height:180px;overflow:auto">Sem dados.</pre></div>'
-    '<div class="field"><label>Utilizadores / Roles</label>'
-    '<div class="muted" style="padding:10px 0">Gerir utilizadores, roles e PCs associados em <b>Admin</b> '
-    '(Utilizadores / roles e PC / Bindings).</div></div>'
     "</section>"
 )
 
@@ -1901,6 +3256,8 @@ _ADMIN_CENTER_PAGE = (
     '👥 Utilizadores / roles</button>'
     '<button type="button" class="btn" id="adm2_btn_bindings" onclick="adminShowPanel(\'bindings\')">'
     '🖥️ PC / Bindings</button>'
+    '<button type="button" class="btn" id="adm2_btn_db" onclick="adminShowPanel(\'db\')">'
+    '🗄️ Administração DB</button>'
     "</div></section>"
     '<section class="card adm2-panel" id="adm2_panel_password" style="padding:16px;margin-bottom:12px">'
     '<h3 style="margin:0 0 10px">Password Admin</h3>'
@@ -1951,6 +3308,7 @@ _ADMIN_CENTER_PAGE = (
     '<div class="table-wrap"><table><thead><tr>'
     '<th>PC / Máquina</th><th>Utilizador</th><th>Nome</th><th>Ativo</th><th>Ações</th>'
     '</tr></thead><tbody id="adm2_bindings"></tbody></table></div></section>'
+    + _ADMIN_HEAVY_HTML +
     "</div>"
 )
 
@@ -1959,13 +3317,14 @@ _ADMIN_CENTER_JS = (
     "function adminCanManage(){return String(user?.role||'').toLowerCase()==='admin'}"
     "function ensureAdminPage(){if(!adminCanManage())throw new Error('Apenas admin')}"
     "function ensureAdminNav(){const b=$('nav-admin');if(!b)return;b.style.display=adminCanManage()?'':'none'}"
-    "function _adm2ApplyPanel(){const panels={password:'adm2_panel_password',emojis:'adm2_panel_emojis',users:'adm2_panel_users',bindings:'adm2_panel_bindings'};"
-    "const btns={password:'adm2_btn_password',emojis:'adm2_btn_emojis',users:'adm2_btn_users',bindings:'adm2_btn_bindings'};"
+    "function _adm2ApplyPanel(){const panels={password:'adm2_panel_password',emojis:'adm2_panel_emojis',users:'adm2_panel_users',bindings:'adm2_panel_bindings',db:'adm2_panel_db'};"
+    "const btns={password:'adm2_btn_password',emojis:'adm2_btn_emojis',users:'adm2_btn_users',bindings:'adm2_btn_bindings',db:'adm2_btn_db'};"
     "Object.keys(panels).forEach(k=>{const el=$(panels[k]);if(el)el.style.display=(k===_adm2Panel)?'':'none';"
     "const b=$(btns[k]);if(b)b.classList.toggle('primary',k===_adm2Panel)});}"
     "async function adminShowPanel(p,skipGuard){const next=String(p||'password');"
     "const run=async()=>{_adm2Panel=next;_adm2ApplyPanel();try{"
-    "if(_adm2Panel==='users')await loadAdminUsers2();else if(_adm2Panel==='bindings')await loadAdminBindings2();else await loadAdminSettings();"
+    "if(_adm2Panel==='users')await loadAdminUsers2();else if(_adm2Panel==='bindings')await loadAdminBindings2();"
+    "else if(_adm2Panel==='db')await loadAdminAll();else await loadAdminSettings();"
     "}catch(e){toast(e.message,true)}};"
     "if(!skipGuard&&window.__unsavedDirty&&typeof _unsavedNavigate==='function')return _unsavedNavigate(()=>adminShowPanel(next,true));"
     "return run()}"
@@ -2250,43 +3609,165 @@ _AUTH_JS = (
     "_idleTimer=setInterval(()=>{if(!_authChecked)return;if(Date.now()>_idleDeadline){authLogout('Sessão expirada por inatividade')}},5000)}"
 )
 
-_PROJECT_PLANNING_HTML = (
-    '<section class="card" style="padding:16px;margin-top:14px">'
-    '<div style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px">'
-    '<h3 style="margin:0">Planeamento avançado (Web)</h3>'
-    '<div style="display:flex;gap:8px;flex-wrap:wrap">'
-    '<button class="btn" type="button" onclick="projectRenderPlanner()">Atualizar grelha</button>'
-    '<button class="btn primary" type="button" onclick="projectSaveChanged()">Guardar alterados</button>'
+_PROJECT_GANTT_HTML = (
+    '<div id="pj-gantt-panel" class="pj-gantt-panel">'
+    '<div class="pj-gantt-head" style="display:flex;justify-content:space-between;align-items:center;flex-wrap:wrap;gap:8px;margin:0 0 10px">'
+    '<h3 style="margin:0">Gantt</h3>'
+    '<div style="display:flex;gap:6px;align-items:center">'
+    '<button class="btn" type="button" id="pj_gantt_expand_btn" onclick="projectGanttToggleExpand()">Expandir</button>'
     "</div></div>"
-    '<div class="muted" id="pj_plan_summary" style="margin-top:8px">Sem dados.</div>'
-    '<div class="table-wrap" style="margin-top:10px"><table>'
-    '<thead><tr><th>TaskID</th><th>Tarefa</th><th>Início</th><th>Prazo</th><th>Ação</th></tr></thead>'
-    '<tbody id="pj_plan_rows"></tbody></table></div>'
-    "</section>"
+    '<div id="pj-gantt-toolbar">'
+    '<button class="btn" type="button" onclick="projectGanttSetView(\'Day\')">Dia</button>'
+    '<button class="btn" type="button" onclick="projectGanttSetView(\'Week\')">Semana</button>'
+    '<button class="btn" type="button" onclick="projectGanttSetView(\'Month\')">Mês</button>'
+    '<button class="btn" type="button" onclick="projectGanttToday()">Hoje</button>'
+    '<button class="btn" type="button" onclick="projectGanttRefresh()">Atualizar</button>'
+    '<button class="btn primary" type="button" id="pj_gantt_toggle_actions" onclick="projectGanttToggleActions()">Ver acções</button>'
+    '<span id="pj-gantt-meta"></span>'
+    "</div>"
+    '<div id="pj-gantt-legend"></div>'
+    '<div id="pj_gantt"></div>'
+    '<section id="pj-gantt-undated"><b>Sem data</b><div id="pj-gantt-undated-body" class="muted">—</div></section>'
+    "</div>"
 )
 
-_PROJECT_PLANNING_JS = (
-    "let _pjBars=[];"
-    "function projectEditableRows(){return (_pjBars||[]).filter(b=>String(b.id||'').startsWith('Task_')&&String(b.type||'').toLowerCase()==='task')}"
-    "function projectRenderPlanner(){const tb=$('pj_plan_rows'),sum=$('pj_plan_summary');if(!tb)return;tb.innerHTML='';"
-    "const rows=projectEditableRows();if(sum)sum.textContent='Linhas editáveis: '+rows.length;"
-    "rows.forEach(r=>{const id=String(r.id||''),label=String(r.label||''),s=String(r.start||'').slice(0,10),e=String(r.end||'').slice(0,10);"
-    "const tr=document.createElement('tr');const key=id.replace(/[^\\w\\-]/g,'_');"
-    "tr.innerHTML='<td>'+esc(id)+'</td><td>'+esc(label)+'</td>'"
-    "+'<td><input id=\"pj_s_'+key+'\" type=\"date\" value=\"'+esc(s)+'\"></td>'"
-    "+'<td><input id=\"pj_e_'+key+'\" type=\"date\" value=\"'+esc(e)+'\"></td>'"
-    "+'<td><button class=\"btn\" onclick=\"projectSaveOne(\\''+encodeURIComponent(id)+'\\')\">Guardar</button></td>';"
-    "tb.appendChild(tr)});if(!rows.length){tb.innerHTML='<tr><td colspan=\"5\" class=\"muted\">Sem linhas editáveis no Gantt.</td></tr>'}}"
-    "function projectCollectChanged(){const ups=[];projectEditableRows().forEach(r=>{const id=String(r.id||''),key=id.replace(/[^\\w\\-]/g,'_');"
-    "const s0=String(r.start||'').slice(0,10),e0=String(r.end||'').slice(0,10);const s=String($('pj_s_'+key)?.value||'').slice(0,10),e=String($('pj_e_'+key)?.value||'').slice(0,10);"
-    "if(s!==s0||e!==e0)ups.push({id,start:s,end:e})});return ups}"
-    "async function projectSaveOne(encId){try{const id=decodeURIComponent(encId),key=id.replace(/[^\\w\\-]/g,'_');"
-    "const s=String($('pj_s_'+key)?.value||'').slice(0,10),e=String($('pj_e_'+key)?.value||'').slice(0,10);"
-    "await api('/api/projects/planning/update',{method:'POST',body:JSON.stringify({updates:[{id,start:s,end:e}]})});"
-    "toast('Planeamento guardado: '+id);await loadProject()}catch(e){toast(e.message,true)}}"
-    "async function projectSaveChanged(){try{const updates=projectCollectChanged();if(!updates.length){toast('Sem alterações');return}"
-    "let j=await api('/api/projects/planning/update',{method:'POST',body:JSON.stringify({updates})});"
-    "toast('Atualizados: '+(j.updated||0)+' / Falhas: '+(j.failed||0));await loadProject()}catch(e){toast(e.message,true)}}"
+_PROJECT_GANTT_CSS = (
+    "#page-project #pj-gantt-panel{position:relative}"
+    "#page-project #pj-gantt-panel.is-max{position:fixed;inset:10px;z-index:1200;background:#fff;border:1px solid #dbe3ef;"
+    "border-radius:12px;padding:16px 18px;box-shadow:0 18px 38px rgba(2,6,23,.22);overflow:auto;display:flex;flex-direction:column}"
+    "#page-project #pj-gantt-panel.is-max #pj_gantt{flex:1;min-height:calc(100vh - 240px)}"
+    "#page-project #pj-gantt-toolbar{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px;"
+    "position:sticky;top:0;z-index:1;background:#fff;padding:4px 0 8px}"
+    "#page-project #pj-gantt-toolbar .btn{padding:5px 10px;font-size:12px}"
+    "#page-project #pj-gantt-toolbar .btn:hover{filter:brightness(.97)}"
+    "#page-project #pj-gantt-toolbar .btn:active{transform:translateY(1px)}"
+    "#page-project #pj-gantt-toolbar .btn:focus-visible{outline:2px solid #93c5fd;outline-offset:1px}"
+    "#page-project #pj-gantt-meta{margin-left:auto;font-size:12px;color:#64748b}"
+    "#page-project #pj-gantt-legend{display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin:-2px 0 8px}"
+    "#page-project #pj-gantt-legend .lg{display:inline-flex;align-items:center;gap:6px;padding:2px 8px;border:1px solid #dbe3ef;border-radius:999px;background:#f8fbff;font-size:11px;color:#334155}"
+    "#page-project #pj-gantt-legend .dot{width:8px;height:8px;border-radius:999px;display:inline-block}"
+    "#page-project #pj-gantt-legend .d-milestone{background:#7c3aed}"
+    "#page-project #pj-gantt-legend .d-task{background:#1e40af}"
+    "#page-project #pj-gantt-legend .d-todo{background:#64748b}"
+    "#page-project #pj-gantt-legend .d-progress{background:#2563eb}"
+    "#page-project #pj-gantt-legend .d-blocked{background:#ea580c}"
+    "#page-project #pj-gantt-legend .d-overdue{background:#dc2626}"
+    "#page-project #pj-gantt-legend .d-done{background:#16a34a}"
+    "#page-project #pj_gantt{min-height:460px;border:1px solid #e5e7eb;border-radius:8px;padding:8px;overflow:auto;background:#fff}"
+    "#page-project #pj_gantt::-webkit-scrollbar{height:10px;width:10px}"
+    "#page-project #pj_gantt::-webkit-scrollbar-thumb{background:#cbd5e1;border-radius:999px}"
+    "#page-project #pj_gantt::-webkit-scrollbar-track{background:#f1f5f9}"
+    "#page-project #pj_gantt .gantt-container{--g-row-color:#f8fafc;--g-border-color:#d7e2ee;--g-tick-color:#e8eef5;--g-tick-color-thick:#d3deea;--g-today-highlight:#0f172a}"
+    "#page-project #pj_gantt .gantt .bar-label{font-size:12px;font-weight:600;text-shadow:0 1px 0 rgba(255,255,255,.25)}"
+    "#page-project #pj_gantt .gantt-container .lower-text{font-size:11px;color:#64748b}"
+    "#page-project #pj_gantt .gantt-container .upper-text{font-size:13px;font-weight:600;color:#1f2937}"
+    "#page-project #pj_gantt .gantt .current-highlight{width:2px}"
+    "#page-project #pj_gantt .gantt .current-date-highlight{font-weight:700}"
+    "#page-project #pj_gantt .gantt .bar-wrapper .bar{rx:4;ry:4}"
+    "#page-project #pj_gantt .gantt .bar-wrapper:hover .bar{filter:brightness(.97)}"
+    "#page-project #pj_gantt .gantt .bar-wrapper:hover .bar-label{fill:#0f172a}"
+    "#page-project #pj_gantt .gantt .row-line{stroke:#dbe5f0}"
+    "#page-project #pj_gantt .gantt .tick{stroke:#e8eef5}"
+    "#page-project #pj_gantt .gantt .tick.thick{stroke:#d3deea}"
+    "#page-project #pj-gantt-undated{margin-top:12px;border:1px dashed #d3deea;border-radius:8px;padding:8px 10px;background:#f8fafc}"
+    "#page-project #pj-gantt-undated b{display:block;margin-bottom:4px}"
+    "#page-project #pj-gantt-undated ul{margin:8px 0 0 16px;padding:0;max-height:112px;overflow:auto}"
+    "#page-project #pj-gantt-undated li{margin:4px 0;line-height:1.35}"
+    "#page-project #pj_gantt .bar-progress{opacity:.9}"
+    "#page-project #pj_gantt .tg-milestone .bar{fill:#8b5cf6;stroke:#6d28d9}"
+    "#page-project #pj_gantt .tg-milestone .bar-progress{fill:#7c3aed}"
+    "#page-project #pj_gantt .tg-task .bar{fill:#1d4ed8;stroke:#1e3a8a}"
+    "#page-project #pj_gantt .tg-task .bar-progress{fill:#1e40af}"
+    "#page-project #pj_gantt .tg-done .bar{fill:#22c55e}"
+    "#page-project #pj_gantt .tg-done .bar-progress{fill:#16a34a}"
+    "#page-project #pj_gantt .tg-progress .bar{fill:#3b82f6}"
+    "#page-project #pj_gantt .tg-progress .bar-progress{fill:#2563eb}"
+    "#page-project #pj_gantt .tg-blocked .bar{fill:#f97316}"
+    "#page-project #pj_gantt .tg-blocked .bar-progress{fill:#ea580c}"
+    "#page-project #pj_gantt .tg-overdue .bar{fill:#ef4444}"
+    "#page-project #pj_gantt .tg-overdue .bar-progress{fill:#dc2626}"
+    "#page-project #pj_gantt .tg-todo .bar{fill:#94a3b8}"
+    "#page-project #pj_gantt .tg-todo .bar-progress{fill:#64748b}"
+    "@media(max-width:1100px){#page-project #pj-gantt-toolbar{gap:6px}#page-project #pj-gantt-toolbar .btn{padding:4px 8px;font-size:11px}#page-project #pj_gantt{min-height:390px}}"
+    "@media(max-width:900px){#page-project #pj-gantt-meta{width:100%;margin-left:0}#page-project #pj-gantt-undated ul{max-height:88px}}"
+)
+
+_PROJECT_GANTT_JS = (
+    "let _pjGanttObj=null,_pjGanttData=null,_pjGanttView='Week',_pjShowActions=false,_pjGanttCanEdit=false,_pjGanttBusy=false;"
+    "function _projectGanttFmtDate(v){try{const d=(v instanceof Date)?v:new Date(v);if(isNaN(d.getTime()))return '';"
+    "const m=String(d.getMonth()+1).padStart(2,'0'),dd=String(d.getDate()).padStart(2,'0');return d.getFullYear()+'-'+m+'-'+dd}catch(_){return ''}}"
+    "function _projectGanttStatusClass(it){const tp=String(it?.item_type||it?.kind||'').toUpperCase();"
+    "if(tp==='MILESTONE')return 'tg-milestone';if(tp==='TASK')return 'tg-task';"
+    "return (typeof _taskGanttStatusClass==='function')?_taskGanttStatusClass(it):'tg-todo'}"
+    "function _projectGanttToRows(items){return(items||[]).map(it=>({"
+    "id:String(it.id||''),name:String(it.name||''),start:String(it.start||''),end:String(it.end||''),"
+    "progress:Number(it.progress||0),dependencies:String(it.dependencies||''),custom_class:_projectGanttStatusClass(it),_raw:it}))}"
+    "function _projectGanttRenderLegend(items){const el=$('pj-gantt-legend');if(!el)return;const arr=(items||[]);"
+    "let ms=0,tasks=0;const c={todo:0,progress:0,blocked:0,overdue:0,done:0};"
+    "arr.forEach(it=>{const tp=String(it?.item_type||it?.kind||'').toUpperCase();"
+    "if(tp==='MILESTONE'){ms++;return}if(tp==='TASK'){tasks++;return}"
+    "const k=_projectGanttStatusClass(it);if(k==='tg-done')c.done++;else if(k==='tg-progress')c.progress++;"
+    "else if(k==='tg-blocked')c.blocked++;else if(k==='tg-overdue')c.overdue++;else c.todo++});"
+    "let html='<span class=\"lg\"><span class=\"dot d-milestone\"></span>Milestones: '+ms+'</span>'"
+    "+'<span class=\"lg\"><span class=\"dot d-task\"></span>Tarefas: '+tasks+'</span>';"
+    "if(_pjShowActions){html+='<span class=\"lg\"><span class=\"dot d-todo\"></span>A fazer: '+c.todo+'</span>'"
+    "+'<span class=\"lg\"><span class=\"dot d-progress\"></span>Em progresso: '+c.progress+'</span>'"
+    "+'<span class=\"lg\"><span class=\"dot d-blocked\"></span>Bloqueada: '+c.blocked+'</span>'"
+    "+'<span class=\"lg\"><span class=\"dot d-overdue\"></span>Atrasada: '+c.overdue+'</span>'"
+    "+'<span class=\"lg\"><span class=\"dot d-done\"></span>Concluída: '+c.done+'</span>'}"
+    "el.innerHTML=html}"
+    "function _projectGanttPopupHtml(t){const r=(t&&t._raw)||{};const tp=String(r.item_type||r.kind||'').toUpperCase();"
+    "let x='';const own=String(r.owner||r.responsavel||'').trim();if(own)x+='<span>Responsável: '+esc(own)+'</span><br>';"
+    "if(r.workers)x+='<span>Equipa: '+esc(r.workers)+'</span><br>';"
+    "if(r.blocked_reason)x+='<span>Bloqueio: '+esc(r.blocked_reason)+'</span><br>';"
+    "if(r.dependencies)x+='<span>Dependências: '+esc(r.dependencies)+'</span><br>';"
+    "if(r.reason&&(!r.start&&!r.end))x+='<span class=\"muted\">'+esc(r.reason)+'</span><br>';"
+    "return `<div style=\"padding:8px 10px;min-width:240px\"><b>${esc(r.name||'')}</b><br>"
+    "<span class=\"muted\">${esc(r.start||'—')} → ${esc(r.end||'—')}</span><br>"
+    "<span>Tipo: ${esc(tp||'—')}</span><br>"
+    "<span>Milestone: ${esc(r.milestone||'—')}</span><br>"
+    "<span>Tarefa: ${esc(r.task_id||'—')}</span><br>"
+    "<span>Status: ${esc(r.status||'—')}</span><br>${x}</div>`}"
+    "function _projectGanttRenderUndated(rows){const box=$('pj-gantt-undated-body');if(!box)return;"
+    "if(!rows||!rows.length){box.innerHTML='<span class=\"muted\">Sem itens sem data.</span>';return}"
+    "box.innerHTML='<ul>'+rows.map(r=>{const rs=r.reason?(' · '+esc(r.reason)):'';"
+    "return `<li><b>${esc(r.item_type||r.kind||'ITEM')}</b> · ${esc(r.milestone||'')} · ${esc(r.task_id||'')} · ${esc(r.name||'—')} "
+    "(${esc(r.status||'—')})${rs}</li>`}).join('')+'</ul>'}"
+    "async function _projectGanttOnDateChange(t,start,end){try{if(!_pjGanttCanEdit||_pjGanttBusy)return;"
+    "const r=(t&&t._raw)||{};const tp=String(r.item_type||r.kind||'').toUpperCase();"
+    "if(tp==='MILESTONE'){toast('O intervalo da milestone é calculado pelas tarefas',true);return}"
+    "const s=_projectGanttFmtDate(start),e=_projectGanttFmtDate(end);if(!s||!e){toast('Datas inválidas',true);return}"
+    "_pjGanttBusy=true;"
+    "if(tp==='TASK'){await api('/api/projects/planning/update',{method:'POST',body:JSON.stringify({updates:[{id:String(r.task_id||''),start:s,end:e}]})});"
+    "if(r){r.start=s;r.end=e}}else{const aid=Number(r.action_id||0);if(!aid)return;"
+    "await api('/api/actions/'+aid+'/gantt-update',{method:'POST',body:JSON.stringify({start_date:s,due_date:e})});"
+    "if(r){r.start=s;r.end=e;r.start_date=s;r.due_date=e}}"
+    "toast('Datas atualizadas')}catch(err){toast(err.message||'Falha ao guardar datas',true);setTimeout(()=>projectGanttRefresh(),50)}"
+    "finally{_pjGanttBusy=false}}"
+    "function _projectGanttRender(){const host=$('pj_gantt');if(!host)return;host.innerHTML='';"
+    "if(!window.Gantt){host.innerHTML='<p class=\"muted\">Frappe Gantt não carregado.</p>';return}"
+    "const srcRows=((_pjGanttData&&_pjGanttData.items)||[]);_projectGanttRenderLegend(srcRows);const rows=_projectGanttToRows(srcRows);"
+    "if(!rows.length){host.innerHTML='<p class=\"muted\">Sem barras para renderizar.</p>';return}"
+    "_pjGanttObj=new Gantt('#pj_gantt',rows,{view_mode:_pjGanttView||'Week',readonly:(!_pjGanttCanEdit),language:'pt',"
+    "date_change:(task,start,end)=>{_projectGanttOnDateChange(task,start,end)},"
+    "custom_popup_html:t=>_projectGanttPopupHtml(t)});}"
+    "function projectGanttSetView(v){_pjGanttView=String(v||'Week');_projectGanttRender()}"
+    "function projectGanttToday(){_pjGanttView='Day';_projectGanttRender()}"
+    "function projectGanttToggleExpand(){const p=$('pj-gantt-panel');if(!p)return;const b=$('pj_gantt_expand_btn');"
+    "const on=p.classList.toggle('is-max');if(b)b.textContent=on?'Restaurar':'Expandir'}"
+    "function projectGanttToggleActions(){_pjShowActions=!_pjShowActions;const b=$('pj_gantt_toggle_actions');"
+    "if(b)b.textContent=_pjShowActions?'Ocultar acções':'Ver acções';projectGanttRefresh()}"
+    "async function projectGanttRefresh(){await projectGanttLoad()}"
+    "async function projectGanttLoad(){try{"
+    "const q=new URLSearchParams();q.set('projeto',$('pj_projeto')?.value||'Todos');"
+    "q.set('milestone',$('pj_milestone')?.value||'Todos');q.set('include_actions',_pjShowActions?'1':'0');"
+    "const j=await api('/api/projects/gantt-data?'+q);_pjGanttData=j||{};"
+    "if($('pj_milestone')&&Array.isArray(j.milestones)){const cur=$('pj_milestone').value||'Todos';"
+    "fill('pj_milestone',j.milestones);$('pj_milestone').value=(j.milestones.includes(cur)?cur:(j.milestone||'Todos'))}"
+    "_pjGanttCanEdit=!!(j&&j.permissions&&j.permissions.can_edit);"
+    "const meta=(j.milestone&&j.milestone!=='Todos')?('Milestone: '+j.milestone+' · '):'';"
+    "if($('pj-gantt-meta'))$('pj-gantt-meta').textContent=meta+(_pjGanttCanEdit?'Edição ativa (drag/resize)':'Somente leitura');"
+    "_projectGanttRenderUndated(j.undated_items||[]);_projectGanttRender()}catch(e){toast(e.message,true)}}"
 )
 
 _STABILITY_CSS = (
@@ -2306,18 +3787,15 @@ _STABILITY_CSS = (
     "#td_desc_rt,#td_res_ini_rt,#td_res_fim_rt{min-height:220px}"
     ".table-wrap{overscroll-behavior:contain}"
     ".table-wrap table{width:100%}"
-    "#page-tasks .table-wrap table{width:100%;min-width:0;table-layout:fixed}"
+    "#page-tasks .table-wrap{overflow:auto;min-height:420px;max-height:calc(100vh - 405px);overscroll-behavior:contain}"
+    "#page-tasks .table-wrap table{width:100%;min-width:100%;table-layout:fixed;border-collapse:separate;border-spacing:0}"
     "#page-tasks .table-wrap th,#page-tasks .table-wrap td{white-space:normal;word-break:break-word;overflow-wrap:anywhere;"
-    "vertical-align:top;line-height:1.25;padding:10px 8px}"
-    "#page-tasks .table-wrap th:nth-child(1),#page-tasks .table-wrap td:nth-child(1){width:120px;min-width:120px;text-align:left}"
-    "#page-tasks .table-wrap th:nth-child(2),#page-tasks .table-wrap td:nth-child(2){width:180px;min-width:150px}"
-    "#page-tasks .table-wrap th:nth-child(6),#page-tasks .table-wrap td:nth-child(6){width:150px}"
-    "#page-tasks .table-wrap th:nth-child(7),#page-tasks .table-wrap td:nth-child(7){width:120px}"
-    "#page-tasks .table-wrap th:nth-child(8),#page-tasks .table-wrap td:nth-child(8){width:120px}"
-    "#page-tasks .table-wrap th:nth-child(9),#page-tasks .table-wrap td:nth-child(9){width:130px}"
-    "#page-tasks .table-wrap th:nth-child(10),#page-tasks .table-wrap td:nth-child(10){width:160px}"
-    "#page-tasks .table-wrap th:nth-child(11),#page-tasks .table-wrap td:nth-child(11){width:110px}"
-    "#page-tasks .table-wrap th:nth-child(12),#page-tasks .table-wrap td:nth-child(12){width:90px}"
+    "vertical-align:top;line-height:1.25;padding:10px 8px;overflow:hidden;text-overflow:ellipsis}"
+    "#page-tasks .table-wrap thead th{position:sticky;top:0;z-index:6;background:#fff;box-shadow:0 1px 0 #e5e7eb}"
+    "#page-tasks .table-wrap th.task-col-th{padding-right:14px}"
+    "#page-tasks .table-wrap th .col-resizer{position:absolute;top:0;right:0;width:8px;height:100%;cursor:col-resize;z-index:4}"
+    "#page-tasks .table-wrap th .col-resizer:hover{background:rgba(37,99,235,.15)}"
+    "#page-tasks .table-wrap td[data-col=\"Tarefa\"],#page-tasks .table-wrap td[data-col=\"Assunto\"],#page-tasks .table-wrap td[data-col=\"Notificacoes\"]{white-space:normal}"
     "#page-tasks .table-wrap th .th-filter-arrow{display:inline-block;margin-left:6px;color:#64748b;cursor:pointer;font-size:11px;line-height:1}"
     "#page-tasks .table-wrap th .th-filter-arrow:hover{color:#0f172a}"
     ".table-wrap th{z-index:3;box-shadow:0 1px 0 #e5e7eb;background:#fff}"
@@ -2328,7 +3806,6 @@ _STABILITY_CSS = (
     "#trows tr.row-overdue td.status-cell{font-weight:700;color:#b91c1c}"
     "#trows tr.row-blocked td{background:#fef2f2}"
     "#trows tr.row-recent td{font-weight:600}"
-    "#trows td:nth-child(3),#trows td:nth-child(5),#trows td:nth-child(11){white-space:normal;word-break:break-word}"
     ".status-cell .te{border:1px solid #bfdbfe}"
     ".status-cell .te-prog{border-color:#7dd3fc}"
     ".status-cell .te-done{border-color:#86efac}"
@@ -2511,23 +3988,11 @@ def _patch_html_system_lists(html: str) -> str:
 
 
 def _patch_html_admin_heavy(html: str) -> str:
-    html = html.replace(
-        '<section class="card" style="padding:16px"><div class="meta" id="sys_meta"></div></section>',
-        _ADMIN_HEAVY_HTML + '<section class="card" style="padding:16px"><div class="meta" id="sys_meta"></div></section>',
-        1,
-    )
     marker = "async function loadSystem(){"
     if marker not in html:
         marker = "function loadSystem(){"
     if "function loadAdminAll" not in html:
         html = html.replace(marker, _ADMIN_HEAVY_JS + marker, 1)
-    html = html.replace(
-        "if(page==='system')$('upd').textContent='Última atualização: '+new Date().toLocaleTimeString('pt-PT');"
-        "loadSystemLists();loadDiagnostics()}catch(e){toast(e.message,true)}}",
-        "if(page==='system')$('upd').textContent='Última atualização: '+new Date().toLocaleTimeString('pt-PT');"
-        "loadSystemLists();loadAdminAll();loadDiagnostics()}catch(e){toast(e.message,true)}}",
-        1,
-    )
     return html
 
 
@@ -2547,28 +4012,151 @@ def _patch_html_auth(html: str) -> str:
         "loadingShow('A iniciar sessão...');await authEnsure();let h=await api('/api/health?_ts='+Date.now());user=h.user;authApplyUser(user);loadingHide();",
         1,
     )
+    if "JSON.stringify({initial:cur" not in html:
+        html = html.replace(
+            "async function odPickNative(){try{let j=await api('/api/folders/onedrive/pick',{method:'POST',body:'{}'});if(j.onedrive_root)$('od_path').value=j.onedrive_root}catch(e){toast(e.message,true)}}",
+            "async function odPickNative(){try{const cur=$('od_path')?.value||'';"
+            "let j=await api('/api/folders/onedrive/pick',{method:'POST',body:JSON.stringify({initial:cur,title:'Configurar OneDrive — 06 Pasta da App'})});"
+            "const p=j.onedrive_root||j.path||'';if(p)$('od_path').value=p}catch(e){toast(e.message,true)}}",
+            1,
+        )
     return html
+
+
+_LOAD_PROJECT_JS = (
+    "async function loadProject(){try{await ensureTaskLookups();const q=new URLSearchParams();"
+    "q.set('projeto',$('pj_projeto')?.value||'Todos');q.set('level','task');"
+    "let j=await api('/api/projects/summary?'+q);"
+    "if($('pj_projeto')&&!$('pj_projeto').dataset.filled){fill('pj_projeto',j.projects||['Todos']);"
+    "$('pj_projeto').dataset.filled='1';if(j.projeto)$('pj_projeto').value=j.projeto}"
+    "const k=j.kpis||{};$('pj_total').textContent=k.total??0;$('pj_done').textContent=(k.done_pct??0)+'%';"
+    "$('pj_overdue').textContent=k.overdue??0;$('pj_blocked').textContent=k.blocked??0;"
+    "await projectGanttLoad();"
+    "if(page==='project')$('upd').textContent='Última atualização: '+new Date().toLocaleTimeString('pt-PT')"
+    "}catch(e){toast(e.message,true)}}"
+)
 
 
 def _patch_html_project_advanced(html: str) -> str:
     html = html.replace(
-        '<h3 style="margin:0 0 10px">Gantt</h3><div id="pj_gantt" style="min-height:280px"></div></section></div><div id="page-scheduled" class="page">',
-        '<h3 style="margin:0 0 10px">Gantt</h3><div id="pj_gantt" style="min-height:280px"></div>'
-        + _PROJECT_PLANNING_HTML +
-        '</section></div><div id="page-scheduled" class="page">',
+        '<select id="pj_projeto" onchange="loadProject()">',
+        "<select id=\"pj_projeto\" onchange=\"if($('pj_milestone'))$('pj_milestone').value='Todos';loadProject()\">",
         1,
     )
-    if "function projectRenderPlanner" not in html:
+    html = html.replace(
+        '<div class="field"><label>Vista</label><select id="pj_level" onchange="loadProject()"><option value="task">Tarefa</option><option value="milestone">Milestone</option></select></div>',
+        '<div class="field"><label>Milestone</label><select id="pj_milestone" onchange="loadProject()"><option>Todos</option></select></div>',
+        1,
+    )
+    html = html.replace(
+        '<h3 style="margin:0 0 10px">Por estado</h3><div id="pj_status_chart" style="min-height:220px;margin-bottom:16px"></div>',
+        "",
+        1,
+    )
+    html = re.sub(
+        r'<section class="card" style="padding:16px;margin-top:14px">\s*<div[^>]*>\s*<h3[^>]*>Planeamento avançado \(Web\)</h3>.*?</section>',
+        "",
+        html,
+        count=1,
+        flags=re.S,
+    )
+    if 'id="pj-gantt-panel"' not in html:
+        replaced = False
+        for old in (
+            '<div class="pj-gantt-head" style="display:flex;justify-content:space-between',
+            '<h3 style="margin:0 0 10px">Gantt</h3><div id="pj_gantt" style="min-height:280px"></div>',
+        ):
+            if old in html:
+                html = re.sub(
+                    r'<div class="pj-gantt-head" style="display:flex;justify-content:space-between.*?</section>\s*(?=</section></div><div id="page-scheduled"|</section></div><div id="page-scheduled")',
+                    _PROJECT_GANTT_HTML,
+                    html,
+                    count=1,
+                    flags=re.S,
+                )
+                if 'id="pj-gantt-panel"' not in html:
+                    html = html.replace(
+                        '<h3 style="margin:0 0 10px">Gantt</h3><div id="pj_gantt" style="min-height:280px"></div>',
+                        _PROJECT_GANTT_HTML,
+                        1,
+                    )
+                replaced = True
+                break
+        if not replaced and 'id="pj-gantt-panel"' not in html:
+            html = html.replace(
+                '<h3 style="margin:0 0 10px">Gantt</h3><div id="pj_gantt" style="min-height:280px"></div></section></div><div id="page-scheduled" class="page">',
+                _PROJECT_GANTT_HTML + '</section></div><div id="page-scheduled" class="page">',
+                1,
+            )
+    if "#page-project #pj-gantt-panel{" not in html and "#page-project #pj_gantt{" in html:
+        html = html.replace("</style>", _PROJECT_GANTT_CSS + "</style>", 1)
+    elif "#page-project #pj-gantt-panel{" not in html:
+        html = html.replace("</style>", _PROJECT_GANTT_CSS + "</style>", 1)
+    if "function projectGanttToggleExpand()" not in html:
+        html = re.sub(
+            r"let _pjGanttObj=null,_pjGanttData=null.*?(?=async function loadProject\(\))",
+            _PROJECT_GANTT_JS,
+            html,
+            count=1,
+            flags=re.S,
+        )
+    if "function projectGanttLoad()" not in html:
         marker = "async function loadProject(){"
         if marker not in html:
             marker = "function loadProject(){"
-        html = html.replace(marker, _PROJECT_PLANNING_JS + marker, 1)
-    html = html.replace(
-        "plotGanttTo($('pj_gantt'),j.gantt||{});const bs=j.by_status||{};",
-        "_pjBars=((j.gantt||{}).bars||[]);plotGanttTo($('pj_gantt'),j.gantt||{});projectRenderPlanner();const bs=j.by_status||{};",
-        1,
+        html = html.replace(marker, _PROJECT_GANTT_JS + marker, 1)
+    html = re.sub(
+        r"async function loadProject\(\)\{try\{.*?\}catch\(e\)\{toast\(e\.message,true\)\}\}",
+        _LOAD_PROJECT_JS,
+        html,
+        count=1,
+        flags=re.S,
     )
     return html
+
+
+_NAV_MENU_INNER = (
+    '<button type="button" data-page="myday" id="nav-myday" onclick="showPage(\'myday\')">'
+    '<span>🎯</span><span class="txt">O Meu Dia</span></button>'
+    '<button type="button" data-page="tasks" id="nav-tasks" onclick="showPage(\'tasks\')">'
+    '<span>📋</span><span class="txt">Tarefas</span></button>'
+    '<button type="button" data-page="scheduled" id="nav-scheduled" onclick="showPage(\'scheduled\')">'
+    '<span>📅</span><span class="txt">Programadas</span></button>'
+    '<button type="button" data-page="dashboard" id="nav-dashboard" onclick="showPage(\'dashboard\')">'
+    '<span>📊</span><span class="txt">Dashboard</span></button>'
+    '<button type="button" data-page="project" id="nav-project" onclick="showPage(\'project\')">'
+    '<span>📁</span><span class="txt">Projeto</span></button>'
+    '<button type="button" data-page="board" id="nav-board" onclick="showPage(\'board\')">'
+    '<span>🗂</span><span class="txt">Board</span></button>'
+    '<div class="nav-sep" aria-hidden="true"></div>'
+    '<button type="button" data-page="shortcuts" id="nav-shortcuts" onclick="showPage(\'shortcuts\')">'
+    '<span>⚡</span><span class="txt">Atalhos</span></button>'
+    '<button type="button" data-page="notes" id="nav-notes" onclick="showPage(\'notes\')">'
+    '<span>📝</span><span class="txt">Notas</span></button>'
+    '<button type="button" data-page="contacts" id="nav-contacts" onclick="showPage(\'contacts\')">'
+    '<span>👥</span><span class="txt">Contactos</span></button>'
+    '<button type="button" data-page="machines" id="nav-machines" onclick="showPage(\'machines\')">'
+    '<span>🏭</span><span class="txt">Máquinas</span></button>'
+    '<button type="button" data-page="ach" id="nav-ach" onclick="showPage(\'ach\')">'
+    '<span>🏆</span><span class="txt">Conquistas</span></button>'
+    '<div class="nav-sep" aria-hidden="true"></div>'
+    '<button type="button" data-page="admin" id="nav-admin" style="display:none" onclick="showPage(\'admin\')">'
+    '<span>🛠</span><span class="txt">Admin</span></button>'
+    '<button type="button" data-page="system" id="nav-system" onclick="showPage(\'system\')">'
+    '<span>⚙</span><span class="txt">Sistema</span></button>'
+)
+
+_NAV_MENU_CSS = ".nav-sep{height:1px;margin:8px 12px;background:#ffffff22}"
+
+
+def _patch_html_nav_order(html: str) -> str:
+    if ".nav-sep{" not in html:
+        html = html.replace("</style>", _NAV_MENU_CSS + "</style>", 1)
+    start = html.find('<div class="nav">')
+    end = html.find('<div class="u">')
+    if start < 0 or end < 0 or end <= start:
+        return html
+    return html[:start] + f'<div class="nav">{_NAV_MENU_INNER}</div>' + html[end:]
 
 
 def _patch_html_stability(html: str) -> str:
@@ -2650,7 +4238,7 @@ def _patch_html_stability(html: str) -> str:
         "Plotly.newPlot(plotEl,trace,layout,{responsive:true,displayModeBar:false})})}).catch(()=>{box.innerHTML='<p class=\"muted\">Gráficos indisponíveis</p>'})}",
         1,
     )
-    return html
+    return _patch_html_nav_order(html)
 
 
 def _patch_html_achievements(html: str) -> str:
@@ -2670,9 +4258,34 @@ def _patch_html_achievements(html: str) -> str:
 
 
 def _patch_html_scheduled(html: str) -> str:
+    if "#page-scheduled .sched-st{" not in html:
+        html = html.replace("</style>", _SCHED_CSS + "</style>", 1)
+    html = html.replace(
+        '<button class="btn" onclick="schedRunDue()">Processar vencidas</button>',
+        '<button class="btn primary" onclick="schedRunDue()" title="Processa automaticamente todas as programadas na janela de execução">Processar todas vencidas</button>',
+        1,
+    )
+    html = html.replace(
+        '<div class="kpi"><div class="ico">👥</div><div><div class="muted">Partilhadas</div><div class="v" id="sch_shared">0</div></div></div></section>',
+        '<div class="kpi"><div class="ico">👥</div><div><div class="muted">Partilhadas</div><div class="v" id="sch_shared">0</div></div></div>'
+        '<div class="kpi kpi-click" onclick="schedFilterFailed()" title="Filtrar programadas com falha">'
+        '<div class="ico">⚠</div><div><div class="muted">Com falha</div><div class="v" id="sch_failed">0</div></div></div></section>',
+        1,
+    )
     html = html.replace(
         '<section class="card"><div class="table-wrap"><table><thead><tr><th>Nome</th>',
-        _SCHED_FILTERS_HTML + '<section class="card"><div class="table-wrap"><table><thead><tr><th>Nome</th>',
+        _SCHED_FILTERS_HTML + _SCHED_TOOLBAR_HTML
+        + '<section class="card"><div class="table-wrap"><table><thead><tr><th>Nome</th>',
+        1,
+    )
+    html = html.replace(
+        '<div class="toolbar"><button class="btn primary" id="sch_new" onclick="schedNew()">Nova</button>'
+        '<button class="btn" id="sch_edit" onclick="schedEdit()" disabled>Editar</button>'
+        '<button class="btn" id="sch_gen" onclick="schedGenerate()" disabled>Gerar agora</button>'
+        '<button class="btn" id="sch_mat" onclick="schedMaterialize()" disabled>Materializar</button>'
+        '<button class="btn" id="sch_toggle" onclick="schedToggleSel()" disabled>Ativar/Desativar</button>'
+        '<button class="btn" id="sch_open_task" onclick="schedOpenTask()" disabled>Abrir tarefa</button></div>',
+        "",
         1,
     )
     html = html.replace(
@@ -2680,22 +4293,64 @@ def _patch_html_scheduled(html: str) -> str:
         '</div>' + _SCHED_LOGS_HTML + '</div><div class="modal-bg" id="sched-modal" style="display:none">',
         1,
     )
+    html = html.replace(
+        "if($('sm_gda'))$('sm_gda').checked=!!row.generate_default_actions;const acts=row.action_defaults||[];"
+        "if($('sm_actions'))$('sm_actions').value=JSON.stringify(acts.length?acts:[{text:'Revisao',due_offset_days:0,owner:''}],null,0);schedRecUI()}",
+        "if($('sm_gda'))$('sm_gda').checked=!!row.generate_default_actions;const acts=row.action_defaults||[];"
+        "if(typeof schedLoadActionsForm==='function')schedLoadActionsForm(acts);"
+        "else if($('sm_actions'))$('sm_actions').value=JSON.stringify(acts.length?acts:[{text:'Revisão',due_offset_days:0,owner:''}],null,0);"
+        "schedRecUI();if($('sm_preview'))$('sm_preview').textContent='Configure a recorrência e use «Pré-visualizar».'}",
+        1,
+    )
+    html = html.replace(
+        "function schedNew(){if(!canEditTasks())return;_schedEditId=null;$('sched-modal-title').textContent='Nova programada';fillSchedModal({",
+        "function schedNew(){if(!canEditTasks())return;_schedEditId=null;"
+        "if($('sched-modal-title'))$('sched-modal-title').textContent='Nova programada';"
+        "if($('sched-modal-sub'))$('sched-modal-sub').textContent='Defina recorrência e valores por omissão da tarefa';"
+        "schedTab('rec');fillSchedModal({",
+        1,
+    )
+    html = html.replace(
+        "$('sched-modal-title').textContent='Editar programada';fillSchedModal(j.row||{});",
+        "if($('sched-modal-title'))$('sched-modal-title').textContent='Editar programada';"
+        "if($('sched-modal-sub'))$('sched-modal-sub').textContent='Alterar template #'+String(_schedSel||'');"
+        "schedTab('rec');fillSchedModal(j.row||{});",
+        1,
+    )
     html = re.sub(
         r"async function loadScheduled\(\)\{try\{let j=await api\('/api/scheduled'\);.*?\}\s*catch\(e\)\{toast\(e.message,true\)\}\}",
         "async function loadScheduled(){try{let j=await api('/api/scheduled');"
-        "_schedRowsAll=j.rows||[];if(!_schedFiltersInit){schedRestoreFilters();schedBindFilters();_schedFiltersInit=true}"
+        "_schedRowsAll=j.rows||[];if(!_schedFiltersInit){await schedRestoreFilters();schedBindFilters();_schedFiltersInit=true}"
         "const s=j.summary||{};$('sch_pending').textContent=s.pending??0;$('sch_active').textContent=s.active??0;"
-        "$('sch_next7').textContent=s.next7??0;$('sch_shared').textContent=s.shared??0;schedRefilter();loadScheduledLogs();"
+        "$('sch_next7').textContent=s.next7??0;$('sch_shared').textContent=s.shared??0;"
+        "if($('sch_failed'))$('sch_failed').textContent=s.failed??0;"
+        "if(window._sched_open_pending){window._sched_open_pending=false;"
+        "if($('sch_f_pending'))$('sch_f_pending').checked=true;if($('sch_f_active'))$('sch_f_active').checked=false;"
+        "schedSaveFilters()}schedRefilter();loadScheduledLogs();"
         "if(page==='scheduled')$('upd').textContent='Última atualização: '+new Date().toLocaleTimeString('pt-PT')}"
         "catch(e){toast(e.message,true)}}",
         html,
         count=1,
     )
+    html = re.sub(
+        r"function renderScheduled\(\)\{const tb=\$\('sch_rows'\);if\(!tb\)return;tb\.innerHTML='';.*?"
+        r"if\(\$\('sch_new'\)\)\$\('sch_new'\)\.style\.display=canEditTasks\(\)\?'inline-block':'none'\}",
+        _SCHED_RENDER_JS.strip(),
+        html,
+        count=1,
+    )
     html = html.replace(
         "let _schedEditId=null;function closeSchedModal(){if($('sched-modal'))$('sched-modal').style.display='none'}",
-        "let _schedFiltersInit=false;" + _SCHED_FILTERS_JS + _SCHED_LOGS_JS +
+        "let _schedFiltersInit=false;" + _SCHED_FILTERS_JS + _SCHED_LOGS_JS + _SCHED_MODAL_JS +
         "let _schedEditId=null;function closeSchedModal(){if($('sched-modal'))$('sched-modal').style.display='none'}",
         1,
+    )
+    html = re.sub(
+        r'<div class="modal-bg" id="sched-modal" style="display:none">.*?</div></div><div id="page-notes"',
+        _SCHED_MODAL_HTML + '<div id="page-notes"',
+        html,
+        count=1,
+        flags=re.S,
     )
     return html
 
@@ -2705,6 +4360,43 @@ def _q1(qs: dict[str, list[str]], key: str, default: str = "") -> str:
     if not vals:
         return default
     return str(vals[0] or default).strip()
+
+
+def _board_truthy(v: Any) -> bool:
+    return str(v or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def _parse_board_filters(q: dict[str, list[str]]) -> dict[str, Any]:
+    f: dict[str, Any] = {
+        "estado": _q1(q, "estado", "Todos"),
+        "prioridade": _q1(q, "prioridade", "Todas"),
+        "projeto": _q1(q, "projeto", "Todos"),
+        "responsavel": _q1(q, "responsavel", "Todos"),
+        "q": _q1(q, "q", ""),
+    }
+    if _board_truthy(_q1(q, "only_mine")):
+        f["only_mine"] = True
+    if _board_truthy(_q1(q, "overdue_only")):
+        f["overdue_only"] = True
+    if _board_truthy(_q1(q, "blocked_only")):
+        f["blocked_only"] = True
+    if _board_truthy(_q1(q, "show_done")):
+        f["show_done"] = True
+    return f
+
+
+def _board_prefs_normalize(payload: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "estado": str(payload.get("estado") or "Todos"),
+        "prioridade": str(payload.get("prioridade") or "Todas"),
+        "responsavel": str(payload.get("responsavel") or "Todos"),
+        "projeto": str(payload.get("projeto") or "Todos"),
+        "q": str(payload.get("q") or "").strip(),
+        "only_mine": bool(payload.get("only_mine")),
+        "overdue_only": bool(payload.get("overdue_only")),
+        "blocked_only": bool(payload.get("blocked_only")),
+        "show_done": bool(payload.get("show_done")),
+    }
 
 
 def _to_iso_date(v: Any) -> str:
@@ -2718,6 +4410,62 @@ def _to_iso_date(v: Any) -> str:
         except Exception:
             pass
     return s[:10] if len(s) >= 10 else ""
+
+
+def _achievement_impact_value(ar: dict[str, Any]) -> float:
+    for key in (
+        "financial_impact_eur",
+        "impact_eur",
+        "Impacto",
+        "ImpactoEUR",
+        "impact",
+        "Valor",
+        "ValorEUR",
+        "ValorEconomico",
+    ):
+        raw = ar.get(key)
+        if raw is None or raw == "":
+            continue
+        s = str(raw).strip().replace("€", "").replace(" ", "")
+        if not s:
+            continue
+        if "," in s and "." in s:
+            if s.rfind(",") > s.rfind("."):
+                s = s.replace(".", "").replace(",", ".")
+            else:
+                s = s.replace(",", "")
+        elif "," in s:
+            s = s.replace(".", "").replace(",", ".")
+        try:
+            return float(s)
+        except Exception:
+            continue
+    return 0.0
+
+
+def _tasks_extras_payload(st: Any, q: dict[str, list[str]], base_mod: Any) -> dict[str, Any]:
+    display = getattr(st, "display_name", st.username) or st.username
+    f = dict(getattr(base_mod, "task_filters", lambda _q: {})(q or {}) or {})
+    rows = st.db.list_tasks(f, st.username, display, st.role) or []
+    tids = {str(r.get("TaskID") or "").strip() for r in rows if isinstance(r, dict) and str(r.get("TaskID") or "").strip()}
+    impact = 0.0
+    linked = 0
+    if tids and hasattr(st.db, "list"):
+        try:
+            for ar in st.db.list({}) or []:
+                if not isinstance(ar, dict):
+                    continue
+                tid = str(ar.get("task_id") or ar.get("TaskID") or "").strip()
+                if not tid or tid not in tids:
+                    continue
+                val = _achievement_impact_value(ar)
+                if val:
+                    impact += val
+                    linked += 1
+        except Exception:
+            pass
+    label = f"{linked} conquista(s) ligada(s)" if linked else "Sem conquistas ligadas"
+    return {"impact_eur": round(impact, 2), "impact_label": label, "linked_achievements": linked}
 
 
 def _dashboard_efficiency_charts(base_mod: Any, st: Any, q: dict[str, list[str]]) -> dict[str, Any]:
@@ -3180,6 +4928,22 @@ def _safe_scalar(conn, sql: str, params: tuple | list = ()) -> Any:
         return None
 
 
+def _checklist_has_action_meta(
+    owner: Any = "",
+    workers: Any = "",
+    start_date: Any = "",
+    due_date: Any = "",
+    status: Any = "",
+    evidence: Any = "",
+    blocked_reason: Any = "",
+) -> bool:
+    """Metadados reais de ação — ignora status sintético ('Não iniciado') em checks."""
+    if any(str(x or "").strip() for x in (owner, workers, start_date, due_date, evidence, blocked_reason)):
+        return True
+    st = str(status or "").strip().lower()
+    return bool(st and st not in ("não iniciado", "nao iniciado", "concluído", "concluido"))
+
+
 def _task_detail_items_sql(db, task_id: str) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     tid = str(task_id or "").strip()
     if not tid:
@@ -3238,12 +5002,16 @@ def _task_detail_items_sql(db, task_id: str) -> tuple[list[dict[str, Any]], list
         status = str(r[9] or "").strip()
         done = bool(r[2]) or status.lower() in ("concluído", "concluido")
         kind = str(r[4] or "CHECK").strip().upper()
-        has_action_meta = any(str(r[idx] or "").strip() for idx in (5, 6, 7, 8, 9, 10, 11))
+        has_action_meta = _checklist_has_action_meta(r[5], r[6], r[7], r[8], r[9], r[10], r[11])
         if kind not in ("ACTION", "CHECK"):
             kind = "ACTION" if has_action_meta else "CHECK"
         elif kind == "CHECK" and has_action_meta:
             # Paridade Desktop: item com campos de ação deve ser tratado como ACTION.
             kind = "ACTION"
+        if kind == "CHECK":
+            item_status = status or ("Concluído" if done else "")
+        else:
+            item_status = status or ("Concluído" if done else "Não iniciado")
         item = {
             "id": int(r[0] or 0),
             "item_text": str(r[1] or "").strip(),
@@ -3255,7 +5023,7 @@ def _task_detail_items_sql(db, task_id: str) -> tuple[list[dict[str, Any]], list
             "workers": str(r[6] or "").strip(),
             "start_date": str(r[7] or "").strip()[:10],
             "due_date": str(r[8] or "").strip()[:10],
-            "status": status or ("Concluído" if done else "Não iniciado"),
+            "status": item_status,
             "evidence": str(r[10] or "").strip(),
             "blocked_reason": str(r[11] or "").strip(),
             "item_uuid": str(r[12] or "").strip(),
@@ -3266,6 +5034,77 @@ def _task_detail_items_sql(db, task_id: str) -> tuple[list[dict[str, Any]], list
         else:
             checks.append(item)
     return actions, checks
+
+
+def _batch_checklist_by_tasks(db, task_ids: list[str]) -> dict[str, tuple[list[dict[str, Any]], list[dict[str, Any]]]]:
+    ids = [str(x or "").strip() for x in (task_ids or []) if str(x or "").strip()]
+    uniq = list(dict.fromkeys(ids))
+    out: dict[str, tuple[list[dict[str, Any]], list[dict[str, Any]]]] = {tid: ([], []) for tid in uniq}
+    if not uniq:
+        return out
+    marks = ",".join(["?"] * len(uniq))
+    rows: list[Any] = []
+    with db.connect() as conn:
+        cur = conn.cursor()
+        sql_core = (
+            "SELECT TaskID, id, COALESCE(item_text,''), COALESCE(done,0), COALESCE([ord],0), COALESCE(kind,'CHECK'), "
+            "COALESCE(owner,''), COALESCE(workers,''), COALESCE(start_date,''), COALESCE(due_date,''), "
+            "COALESCE(status,''), COALESCE(evidence,''), COALESCE(blocked_reason,''), COALESCE(item_uuid,''), "
+            "COALESCE(action_notes,'') FROM dbo.task_checklist WHERE TaskID IN ("
+            + marks
+            + ") "
+        )
+        variants = [
+            sql_core + "AND ISNULL(is_deleted,0)=0 AND COALESCE(deleted_at,'')='' ORDER BY TaskID, [ord], id;",
+            sql_core + "AND ISNULL(is_deleted,0)=0 ORDER BY TaskID, [ord], id;",
+            sql_core + "ORDER BY TaskID, [ord], id;",
+        ]
+        for sql in variants:
+            try:
+                cur.execute(sql, tuple(uniq))
+                rows = cur.fetchall() or []
+                break
+            except Exception:
+                continue
+    for r in rows:
+        tid = str(r[0] or "").strip()
+        if tid not in out:
+            continue
+        status = str(r[10] or "").strip()
+        done = bool(r[3]) or status.lower() in ("concluído", "concluido")
+        kind = str(r[5] or "CHECK").strip().upper()
+        has_action_meta = _checklist_has_action_meta(r[6], r[7], r[8], r[9], r[10], r[11], r[12])
+        if kind not in ("ACTION", "CHECK"):
+            kind = "ACTION" if has_action_meta else "CHECK"
+        elif kind == "CHECK" and has_action_meta:
+            kind = "ACTION"
+        if kind == "CHECK":
+            item_status = status or ("Concluído" if done else "")
+        else:
+            item_status = status or ("Concluído" if done else "Não iniciado")
+        item = {
+            "id": int(r[1] or 0),
+            "item_text": str(r[2] or "").strip(),
+            "done": done,
+            "is_done": done,
+            "ord": int(r[4] or 0),
+            "kind": kind,
+            "owner": str(r[6] or "").strip(),
+            "workers": str(r[7] or "").strip(),
+            "start_date": str(r[8] or "").strip()[:10],
+            "due_date": str(r[9] or "").strip()[:10],
+            "status": item_status,
+            "evidence": str(r[11] or "").strip(),
+            "blocked_reason": str(r[12] or "").strip(),
+            "item_uuid": str(r[13] or "").strip(),
+            "action_notes": str(r[14] or "").strip(),
+        }
+        actions, checks = out[tid]
+        if kind == "ACTION":
+            actions.append(item)
+        else:
+            checks.append(item)
+    return out
 
 
 def _action_deps_get_sql(db, action_id: int) -> list[dict[str, Any]]:
@@ -3989,6 +5828,23 @@ def _auth_suggest_login_mode(db, machine: str, windows_user: str, binding: dict[
     return "pc"
 
 
+def _milestone_label(raw: Any) -> str:
+    s = str(raw or "").strip()
+    return s if s else "(sem milestone)"
+
+
+def _milestone_gantt_id(name: str) -> str:
+    s = re.sub(r"[^\w\-]", "_", str(name or "sem_milestone").strip())[:96]
+    return f"ms_{s}"
+
+
+def _milestone_progress(tasks: list[dict[str, Any]]) -> int:
+    if not tasks:
+        return 0
+    done = sum(1 for t in tasks if "conclu" in str(t.get("Estado") or "").strip().lower())
+    return int(round(100.0 * done / len(tasks)))
+
+
 def _planning_update_tasks(db, username: str, display: str, role: str, updates: list[dict[str, Any]]) -> dict[str, Any]:
     ok = 0
     fail = 0
@@ -4077,7 +5933,7 @@ def _scheduled_log_path(base_mod: Any) -> Path:
 
 
 def _scheduled_log_append(
-    base_mod: Any,
+    db: Any,
     action: str,
     user: str,
     ok: bool,
@@ -4085,18 +5941,10 @@ def _scheduled_log_append(
     details: dict[str, Any] | None = None,
 ) -> None:
     try:
-        path = _scheduled_log_path(base_mod)
-        path.parent.mkdir(parents=True, exist_ok=True)
-        entry = {
-            "ts": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            "action": str(action or "").strip(),
-            "user": str(user or "").strip(),
-            "ok": bool(ok),
-            "message": str(message or "").strip(),
-            "details": details or {},
-        }
-        with path.open("a", encoding="utf-8") as f:
-            f.write(json.dumps(entry, ensure_ascii=False) + "\n")
+        svc = getattr(db, "_scheduled", None)
+        if svc is None:
+            return
+        svc.append_op(action, user, ok, message, details)
     except Exception as ex:
         try:
             base_mod.log(f"Aviso: erro ao registar log de Programadas: {ex}")
@@ -4104,36 +5952,24 @@ def _scheduled_log_append(
             pass
 
 
-def _scheduled_log_read(base_mod: Any, limit: int = 120) -> list[dict[str, Any]]:
-    path = _scheduled_log_path(base_mod)
-    if not path.is_file():
-        return []
-    out: list[dict[str, Any]] = []
+def _scheduled_log_read(db: Any, base_mod: Any, limit: int = 120) -> list[dict[str, Any]]:
     try:
-        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        for line in lines[-max(1, int(limit)) :]:
-            try:
-                obj = json.loads(line)
-                if isinstance(obj, dict):
-                    out.append(obj)
-            except Exception:
-                continue
+        svc = getattr(db, "_scheduled", None)
+        if svc is None:
+            return []
+        return svc.list_ops(limit, str(_scheduled_log_path(base_mod)))
     except Exception:
         return []
-    out.reverse()
-    return out
 
 
-def _scheduled_log_clear(base_mod: Any) -> None:
-    path = _scheduled_log_path(base_mod)
+def _scheduled_log_clear(db: Any) -> None:
     try:
-        if path.is_file():
-            path.unlink()
+        svc = getattr(db, "_scheduled", None)
+        if svc is None:
+            return
+        svc.clear_ops()
     except Exception:
-        try:
-            path.write_text("", encoding="utf-8")
-        except Exception:
-            pass
+        pass
 
 
 def _patch_database(Database, base_mod):
@@ -4448,9 +6284,14 @@ def _patch_database(Database, base_mod):
         def _norm_item(raw: Any, fallback_kind: str) -> dict[str, Any]:
             it = dict(raw or {})
             kind = str(it.get("kind") or fallback_kind or "").strip().upper()
-            has_action_meta = any(
-                str(it.get(k) or "").strip()
-                for k in ("owner", "workers", "status", "start_date", "due_date", "evidence", "blocked_reason")
+            has_action_meta = _checklist_has_action_meta(
+                it.get("owner"),
+                it.get("workers"),
+                it.get("start_date"),
+                it.get("due_date"),
+                it.get("status"),
+                it.get("evidence"),
+                it.get("blocked_reason"),
             )
             if kind not in ("ACTION", "CHECK"):
                 kind = "ACTION" if has_action_meta else "CHECK"
@@ -4540,7 +6381,207 @@ def _patch_database(Database, base_mod):
             "permissions": {"can_edit": bool(detail.get("can_edit"))},
         }
 
+    def get_project_gantt_data(
+        self,
+        projeto: str,
+        milestone: str,
+        include_actions: bool,
+        username: str,
+        display: str,
+        role: str,
+    ) -> dict:
+        proj = str(projeto or "Todos").strip() or "Todos"
+        ms_filter = _milestone_label(milestone) if str(milestone or "Todos").strip() not in ("", "Todos") else "Todos"
+        base_filters: dict[str, Any] = {"projeto": proj, "show_done": True}
+        all_rows = self.list_tasks(base_filters, username, display, role) or []
+        milestones = sorted({_milestone_label(r.get("Milestone")) for r in all_rows})
+        rows = list(all_rows)
+        if ms_filter != "Todos":
+            rows = [r for r in rows if _milestone_label(r.get("Milestone")) == ms_filter]
+        rows.sort(
+            key=lambda r: (
+                _milestone_label(r.get("Milestone")),
+                str(r.get("InicioPrevisto") or r.get("DataRegisto") or "9999"),
+                str(r.get("Tarefa") or ""),
+            )
+        )
+        groups: dict[str, list[dict[str, Any]]] = {}
+        for task in rows:
+            ms = _milestone_label(task.get("Milestone"))
+            groups.setdefault(ms, []).append(task)
+        task_ids = [str(r.get("TaskID") or "").strip() for r in rows if str(r.get("TaskID") or "").strip()]
+        checklist_map: dict[str, tuple[list, list]] = {}
+        all_action_ids: list[int] = []
+        if include_actions and task_ids:
+            checklist_map = _batch_checklist_by_tasks(self, task_ids)
+            for acts, _ in checklist_map.values():
+                for a in acts:
+                    aid = int(a.get("id") or 0)
+                    if aid > 0:
+                        all_action_ids.append(aid)
+        deps_map: dict[int, str] = {}
+        if all_action_ids:
+            try:
+                with self.connect() as conn:
+                    deps_map = _gantt_deps_map(conn, all_action_ids)
+            except Exception:
+                deps_map = {}
+        today = datetime.now().strftime("%Y-%m-%d")
+        items: list[dict[str, Any]] = []
+        undated: list[dict[str, Any]] = []
+        can_edit = bool(_can_edit_role(role))
+
+        def _append_actions(tid: str, ms: str) -> None:
+            if not include_actions:
+                return
+            actions, _checks = checklist_map.get(tid, ([], []))
+            for it in actions:
+                kind = str(it.get("kind") or "ACTION").strip().upper()
+                if kind != "ACTION":
+                    continue
+                aid = int(it.get("id") or 0)
+                aname = str(it.get("item_text") or "").strip()
+                st = str(it.get("status") or "").strip()
+                if not st:
+                    st = "Concluído" if bool(it.get("is_done")) else "Não iniciado"
+                a_start, a_end, a_reason = _gantt_norm_dates(it.get("start_date"), it.get("due_date"))
+                label = ("    ↳ " + aname) if aname else "    ↳ Ação"
+                if a_start and a_end:
+                    items.append(
+                        {
+                            "id": f"action_{aid}",
+                            "action_id": aid,
+                            "task_id": tid,
+                            "milestone": ms,
+                            "name": label,
+                            "start": a_start,
+                            "end": a_end,
+                            "progress": _gantt_progress(st),
+                            "status": st,
+                            "done": bool(it.get("done") or it.get("is_done")),
+                            "is_done": bool(it.get("done") or it.get("is_done")),
+                            "blocked_reason": str(it.get("blocked_reason") or "").strip(),
+                            "owner": str(it.get("owner") or "").strip(),
+                            "workers": str(it.get("workers") or "").strip(),
+                            "item_type": "ACTION",
+                            "kind": "ACTION",
+                            "dependencies": deps_map.get(aid, ""),
+                            "is_overdue": bool(a_end < today and ("conclu" not in st.lower())),
+                        }
+                    )
+                else:
+                    undated.append(
+                        {
+                            "id": f"action_{aid}",
+                            "action_id": aid,
+                            "task_id": tid,
+                            "milestone": ms,
+                            "name": label,
+                            "status": st,
+                            "item_type": "ACTION",
+                            "kind": "ACTION",
+                            "reason": a_reason or "sem datas",
+                        }
+                    )
+
+        for ms in sorted(groups.keys()):
+            tasks_in_ms = groups[ms]
+            ms_starts: list[str] = []
+            ms_ends: list[str] = []
+            for t in tasks_in_ms:
+                s, e, _ = _gantt_norm_dates(t.get("InicioPrevisto") or t.get("DataRegisto"), t.get("Prazo"))
+                if s and e:
+                    ms_starts.append(s)
+                    ms_ends.append(e)
+            ms_id = _milestone_gantt_id(ms)
+            if ms_starts and ms_ends:
+                items.append(
+                    {
+                        "id": ms_id,
+                        "milestone": ms,
+                        "name": f"◆ {ms} ({len(tasks_in_ms)})",
+                        "start": min(ms_starts),
+                        "end": max(ms_ends),
+                        "progress": _milestone_progress(tasks_in_ms),
+                        "status": f"{len(tasks_in_ms)} tarefa(s)",
+                        "item_type": "MILESTONE",
+                        "kind": "MILESTONE",
+                        "dependencies": "",
+                        "task_count": len(tasks_in_ms),
+                    }
+                )
+            else:
+                undated.append(
+                    {
+                        "id": ms_id,
+                        "milestone": ms,
+                        "name": f"◆ {ms}",
+                        "item_type": "MILESTONE",
+                        "kind": "MILESTONE",
+                        "status": f"{len(tasks_in_ms)} tarefa(s)",
+                        "reason": "sem datas nas tarefas",
+                    }
+                )
+            for task in tasks_in_ms:
+                tid = str(task.get("TaskID") or "").strip()
+                if not tid:
+                    continue
+                title = str(task.get("Tarefa") or tid).strip()
+                status = str(task.get("Estado") or "").strip() or "Não iniciado"
+                start, end, reason = _gantt_norm_dates(
+                    task.get("InicioPrevisto") or task.get("DataRegisto"),
+                    task.get("Prazo"),
+                )
+                label = "  · " + title
+                if start and end:
+                    items.append(
+                        {
+                            "id": tid,
+                            "task_id": tid,
+                            "milestone": ms,
+                            "name": label,
+                            "start": start,
+                            "end": end,
+                            "progress": _gantt_progress(status),
+                            "status": status,
+                            "item_type": "TASK",
+                            "kind": "TASK",
+                            "dependencies": "",
+                        "is_overdue": bool(end < today and ("conclu" not in status.lower())),
+                        "projeto": str(task.get("Projeto") or "").strip(),
+                        "milestone": ms,
+                        "owner": str(task.get("Responsavel") or "").strip(),
+                        "responsavel": str(task.get("Responsavel") or "").strip(),
+                    }
+                    )
+                else:
+                    undated.append(
+                        {
+                            "id": tid,
+                            "task_id": tid,
+                            "milestone": ms,
+                            "name": label,
+                            "status": status,
+                            "item_type": "TASK",
+                            "kind": "TASK",
+                            "reason": reason or "sem datas",
+                        }
+                    )
+                _append_actions(tid, ms)
+        return {
+            "projeto": proj,
+            "milestone": ms_filter,
+            "milestones": ["Todos"] + milestones,
+            "include_actions": bool(include_actions),
+            "task_count": len(rows),
+            "milestone_count": len(groups),
+            "items": items,
+            "undated_items": undated,
+            "permissions": {"can_edit": can_edit},
+        }
+
     Database.get_task_gantt_data = get_task_gantt_data  # type: ignore[method-assign]
+    Database.get_project_gantt_data = get_project_gantt_data  # type: ignore[method-assign]
 
     def update_action_gantt_dates(
         self, action_id: int, start_date: str, due_date: str, username: str, display: str, role: str
@@ -4639,26 +6680,26 @@ def _patch_database(Database, base_mod):
         try:
             new_id = _orig_insert_scheduled(self, payload, username, role)
             _scheduled_log_append(
-                base_mod, "template_create", username, True,
+                self, "template_create", username, True,
                 f"Template criado #{new_id}",
                 {"template_id": int(new_id or 0)},
             )
             return new_id
         except Exception as ex:
-            _scheduled_log_append(base_mod, "template_create", username, False, str(ex))
+            _scheduled_log_append(self, "template_create", username, False, str(ex))
             raise
 
     def update_scheduled(self, template_id: int, payload: dict, username: str, role: str) -> None:
         try:
             _orig_update_scheduled(self, template_id, payload, username, role)
             _scheduled_log_append(
-                base_mod, "template_update", username, True,
+                self, "template_update", username, True,
                 f"Template #{int(template_id)} atualizado",
                 {"template_id": int(template_id)},
             )
         except Exception as ex:
             _scheduled_log_append(
-                base_mod, "template_update", username, False, str(ex), {"template_id": int(template_id or 0)}
+                self, "template_update", username, False, str(ex), {"template_id": int(template_id or 0)}
             )
             raise
 
@@ -4666,14 +6707,14 @@ def _patch_database(Database, base_mod):
         try:
             is_active = _orig_toggle_scheduled(self, template_id, username, role)
             _scheduled_log_append(
-                base_mod, "template_toggle", username, True,
+                self, "template_toggle", username, True,
                 f"Template #{int(template_id)} {'ativado' if is_active else 'desativado'}",
                 {"template_id": int(template_id), "is_active": bool(is_active)},
             )
             return is_active
         except Exception as ex:
             _scheduled_log_append(
-                base_mod, "template_toggle", username, False, str(ex), {"template_id": int(template_id or 0)}
+                self, "template_toggle", username, False, str(ex), {"template_id": int(template_id or 0)}
             )
             raise
 
@@ -4681,13 +6722,13 @@ def _patch_database(Database, base_mod):
         try:
             msg = _orig_generate_scheduled(self, template_id, username, display, role)
             _scheduled_log_append(
-                base_mod, "generate_now", username, True, str(msg or ""),
+                self, "generate_now", username, True, str(msg or ""),
                 {"template_id": int(template_id)},
             )
             return msg
         except Exception as ex:
             _scheduled_log_append(
-                base_mod, "generate_now", username, False, str(ex), {"template_id": int(template_id or 0)}
+                self, "generate_now", username, False, str(ex), {"template_id": int(template_id or 0)}
             )
             raise
 
@@ -4695,13 +6736,13 @@ def _patch_database(Database, base_mod):
         try:
             msg = _orig_materialize(self, template_id, username, display, role)
             _scheduled_log_append(
-                base_mod, "materialize_pending", username, True, str(msg or ""),
+                self, "materialize_pending", username, True, str(msg or ""),
                 {"template_id": int(template_id)},
             )
             return msg
         except Exception as ex:
             _scheduled_log_append(
-                base_mod, "materialize_pending", username, False, str(ex), {"template_id": int(template_id or 0)}
+                self, "materialize_pending", username, False, str(ex), {"template_id": int(template_id or 0)}
             )
             raise
 
@@ -4709,7 +6750,7 @@ def _patch_database(Database, base_mod):
         try:
             rep = _orig_generate_due(self, username, display, role, dry_run=dry_run)
             _scheduled_log_append(
-                base_mod,
+                self,
                 "process_due",
                 username,
                 True,
@@ -4724,7 +6765,7 @@ def _patch_database(Database, base_mod):
             )
             return rep
         except Exception as ex:
-            _scheduled_log_append(base_mod, "process_due", username, False, str(ex), {"dry_run": bool(dry_run)})
+            _scheduled_log_append(self, "process_due", username, False, str(ex), {"dry_run": bool(dry_run)})
             raise
 
     Database.insert_scheduled = insert_scheduled  # type: ignore[method-assign]
@@ -5034,13 +7075,25 @@ def _patch_handler(Handler, STATE, parse_path, AppError, PermissionError, base_m
                     return self.err(400, "Utilizador inválido")
                 allowed = _task_cols_defaults()
                 cols = list(allowed)
+                widths: dict[str, int] = {}
                 up = _prefs_get(st, username) or {}
                 raw = str(up.get("visible_columns_json") or "")
                 if raw:
                     data = json.loads(raw)
                     if isinstance(data, dict):
                         cols = _task_cols_normalize(data.get("columns") or [], allowed) or cols
-                return self.json({"columns": cols, "available_columns": allowed})
+                        raw_w = data.get("widths")
+                        if isinstance(raw_w, dict):
+                            for k, v in raw_w.items():
+                                kk = str(k or "").strip()
+                                if kk in allowed:
+                                    try:
+                                        w = int(v)
+                                        if 40 <= w <= 900:
+                                            widths[kk] = w
+                                    except Exception:
+                                        pass
+                return self.json({"columns": cols, "available_columns": allowed, "widths": widths})
             except Exception as e:
                 traceback.print_exc()
                 return self.err(500, str(e))
@@ -5587,9 +7640,80 @@ def _patch_handler(Handler, STATE, parse_path, AppError, PermissionError, base_m
                 return self.err(500, str(e))
         if p == "/api/scheduled/logs":
             try:
+                st = base_mod.STATE
+                if st is None or getattr(st, "db", None) is None:
+                    return self.err(503, "Servidor a inicializar — aguarde alguns segundos")
                 limit = int(_q1(q or {}, "limit", "120") or "120")
                 limit = max(1, min(500, limit))
-                return self.json({"rows": _scheduled_log_read(base_mod, limit)})
+                return self.json({"rows": _scheduled_log_read(st.db, base_mod, limit)})
+            except Exception as e:
+                traceback.print_exc()
+                return self.err(500, str(e))
+        if p == "/api/scheduled/prefs":
+            try:
+                st = base_mod.STATE
+                if st is None or getattr(st, "db", None) is None:
+                    return self.err(503, "Servidor a inicializar — aguarde alguns segundos")
+                username = str(getattr(st, "username", "") or "").strip()
+                if not username:
+                    return self.err(400, "Utilizador inválido")
+                up = _prefs_get(st, username) or {}
+                raw = str(up.get("filters_json") or "").strip()
+                prefs: dict[str, Any] = {}
+                if raw:
+                    data = json.loads(raw)
+                    if isinstance(data, dict):
+                        sv = data.get("scheduled_v1")
+                        if isinstance(sv, dict):
+                            prefs = sv
+                return self.json({"prefs": prefs or {}})
+            except Exception as e:
+                traceback.print_exc()
+                return self.err(500, str(e))
+        if p == "/api/board/prefs":
+            try:
+                st = base_mod.STATE
+                if st is None or getattr(st, "db", None) is None:
+                    return self.err(503, "Servidor a inicializar — aguarde alguns segundos")
+                username = str(getattr(st, "username", "") or "").strip()
+                if not username:
+                    return self.err(400, "Utilizador inválido")
+                up = _prefs_get(st, username) or {}
+                raw = str(up.get("board_filters_json") or "").strip()
+                prefs: dict[str, Any] = {}
+                if raw:
+                    data = json.loads(raw)
+                    if isinstance(data, dict):
+                        prefs = _board_prefs_normalize(data)
+                return self.json({"prefs": prefs or {}})
+            except Exception as e:
+                traceback.print_exc()
+                return self.err(500, str(e))
+        if p == "/api/board":
+            try:
+                st = base_mod.STATE
+                if st is None or getattr(st, "db", None) is None:
+                    return self.err(503, "Servidor a inicializar — aguarde alguns segundos")
+                display = getattr(st, "display_name", st.username) or st.username
+                bf = _parse_board_filters(q or {})
+                out = st.db.list_board(bf, st.username, display, st.role)
+                return self.json(out)
+            except Exception as e:
+                traceback.print_exc()
+                return self.err(500, str(e))
+        if p == "/api/projects/gantt-data":
+            try:
+                st = base_mod.STATE
+                if st is None or getattr(st, "db", None) is None:
+                    return self.err(503, "Servidor a inicializar — aguarde alguns segundos")
+                projeto = _q1(q or {}, "projeto", "Todos")
+                milestone = _q1(q or {}, "milestone", "Todos")
+                include_actions = _q1(q or {}, "include_actions", "0") in ("1", "true", "yes", "on")
+                display = getattr(st, "display_name", st.username) or st.username
+                out = st.db.get_project_gantt_data(
+                    projeto, milestone, include_actions, st.username, display, st.role
+                )
+                return self.json(out)
             except Exception as e:
                 traceback.print_exc()
                 return self.err(500, str(e))
@@ -5660,6 +7784,15 @@ def _patch_handler(Handler, STATE, parse_path, AppError, PermissionError, base_m
                 aid = int(str(m_action_deps.group(1) or "0"))
                 deps = _action_deps_get_sql(st.db, aid)
                 return self.json({"action_id": aid, "deps": deps})
+            except Exception as e:
+                traceback.print_exc()
+                return self.err(500, str(e))
+        if p == "/api/tasks/extras":
+            try:
+                st = base_mod.STATE
+                if st is None or getattr(st, "db", None) is None:
+                    return self.err(503, "Servidor a inicializar — aguarde alguns segundos")
+                return self.json(_tasks_extras_payload(st, q or {}, base_mod))
             except Exception as e:
                 traceback.print_exc()
                 return self.err(500, str(e))
@@ -5835,6 +7968,19 @@ def _patch_handler(Handler, STATE, parse_path, AppError, PermissionError, base_m
                         vis_widths = dict(cur_vis.get("widths") or {})
                 except Exception:
                     vis_widths = {}
+                raw_widths = payload.get("widths")
+                if isinstance(raw_widths, dict):
+                    for k, v in raw_widths.items():
+                        kk = str(k or "").strip()
+                        if kk not in allowed:
+                            continue
+                        try:
+                            w = int(v)
+                            if 40 <= w <= 900:
+                                vis_widths[kk] = w
+                        except Exception:
+                            pass
+                vis_widths = {k: vis_widths[k] for k in cols if k in vis_widths}
                 try:
                     font_size = int(current.get("font_size") or 10)
                 except Exception:
@@ -5853,7 +7999,7 @@ def _patch_handler(Handler, STATE, parse_path, AppError, PermissionError, base_m
                     "board_filters_json": current.get("board_filters_json"),
                 }
                 _prefs_upsert(st, username, prefs_payload)
-                return self.json({"ok": True, "columns": cols})
+                return self.json({"ok": True, "columns": cols, "widths": vis_widths})
             except Exception as e:
                 traceback.print_exc()
                 return self.err(500, str(e))
@@ -6237,7 +8383,7 @@ def _patch_handler(Handler, STATE, parse_path, AppError, PermissionError, base_m
                     return self.err(503, "Servidor a inicializar — aguarde alguns segundos")
                 if not _is_admin(st.role):
                     return self.err(403, "Apenas admin")
-                _scheduled_log_clear(base_mod)
+                _scheduled_log_clear(st.db)
                 log_path = base_mod.cache_dir() / "web_ui_local.log"
                 kept = 0
                 if log_path.exists():
@@ -6250,7 +8396,95 @@ def _patch_handler(Handler, STATE, parse_path, AppError, PermissionError, base_m
                 return self.err(500, str(e))
         if p == "/api/scheduled/logs/clear":
             try:
-                _scheduled_log_clear(base_mod)
+                st = base_mod.STATE
+                if st is None or getattr(st, "db", None) is None:
+                    return self.err(503, "Servidor a inicializar — aguarde alguns segundos")
+                _scheduled_log_clear(st.db)
+                return self.json({"ok": True})
+            except Exception as e:
+                traceback.print_exc()
+                return self.err(500, str(e))
+        if p == "/api/scheduled/prefs":
+            try:
+                st = base_mod.STATE
+                if st is None or getattr(st, "db", None) is None:
+                    return self.err(503, "Servidor a inicializar — aguarde alguns segundos")
+                username = str(getattr(st, "username", "") or "").strip()
+                if not username:
+                    return self.err(400, "Utilizador inválido")
+                payload = self.read()
+                if not isinstance(payload, dict):
+                    payload = {}
+                current = _prefs_get(st, username) or {}
+                raw = str(current.get("filters_json") or "").strip()
+                all_filters: dict[str, Any] = {}
+                if raw:
+                    try:
+                        obj = json.loads(raw)
+                        if isinstance(obj, dict):
+                            all_filters = obj
+                    except Exception:
+                        all_filters = {}
+                all_filters["scheduled_v1"] = {
+                    "q": str(payload.get("q") or ""),
+                    "pending": bool(payload.get("pending")),
+                    "active": bool(payload.get("active", True)),
+                    "failed": bool(payload.get("failed")),
+                    "rec": str(payload.get("rec") or "Todos"),
+                    "mode": str(payload.get("mode") or "Todos"),
+                }
+                try:
+                    font_size = int(current.get("font_size") or 10)
+                except Exception:
+                    font_size = 10
+                prefs_payload = {
+                    "theme": current.get("theme") or (getattr(st.db, "cfg", {}) or {}).get("theme"),
+                    "view_density": current.get("view_density") or (getattr(st.db, "cfg", {}) or {}).get("view_density"),
+                    "font_size": font_size,
+                    "zebra_intensity": current.get("zebra_intensity") or (getattr(st.db, "cfg", {}) or {}).get("zebra_intensity"),
+                    "show_statusbar": bool(current.get("show_statusbar", True)),
+                    "accent_theme": current.get("accent_theme") or (getattr(st.db, "cfg", {}) or {}).get("accent_theme"),
+                    "filters_json": json.dumps(all_filters, ensure_ascii=False),
+                    "col_layout_json": current.get("col_layout_json"),
+                    "visible_columns_json": current.get("visible_columns_json"),
+                    "window_states_json": current.get("window_states_json"),
+                    "board_filters_json": current.get("board_filters_json"),
+                }
+                _prefs_upsert(st, username, prefs_payload)
+                return self.json({"ok": True})
+            except Exception as e:
+                traceback.print_exc()
+                return self.err(500, str(e))
+        if p == "/api/board/prefs":
+            try:
+                st = base_mod.STATE
+                if st is None or getattr(st, "db", None) is None:
+                    return self.err(503, "Servidor a inicializar — aguarde alguns segundos")
+                username = str(getattr(st, "username", "") or "").strip()
+                if not username:
+                    return self.err(400, "Utilizador inválido")
+                payload = self.read()
+                if not isinstance(payload, dict):
+                    payload = {}
+                current = _prefs_get(st, username) or {}
+                try:
+                    font_size = int(current.get("font_size") or 10)
+                except Exception:
+                    font_size = 10
+                prefs_payload = {
+                    "theme": current.get("theme") or (getattr(st.db, "cfg", {}) or {}).get("theme"),
+                    "view_density": current.get("view_density") or (getattr(st.db, "cfg", {}) or {}).get("view_density"),
+                    "font_size": font_size,
+                    "zebra_intensity": current.get("zebra_intensity") or (getattr(st.db, "cfg", {}) or {}).get("zebra_intensity"),
+                    "show_statusbar": bool(current.get("show_statusbar", True)),
+                    "accent_theme": current.get("accent_theme") or (getattr(st.db, "cfg", {}) or {}).get("accent_theme"),
+                    "filters_json": current.get("filters_json"),
+                    "col_layout_json": current.get("col_layout_json"),
+                    "visible_columns_json": current.get("visible_columns_json"),
+                    "window_states_json": current.get("window_states_json"),
+                    "board_filters_json": json.dumps(_board_prefs_normalize(payload), ensure_ascii=False),
+                }
+                _prefs_upsert(st, username, prefs_payload)
                 return self.json({"ok": True})
             except Exception as e:
                 traceback.print_exc()
@@ -6291,6 +8525,34 @@ def _patch_handler(Handler, STATE, parse_path, AppError, PermissionError, base_m
                 return self.err(403, str(e) or "Sem permissão")
             except AppError as e:
                 return self.err(400, str(e) or "Pedido inválido")
+            except Exception as e:
+                traceback.print_exc()
+                return self.err(500, str(e))
+        if p == "/api/folders/onedrive/pick":
+            try:
+                st = base_mod.STATE
+                if st is None:
+                    return self.err(503, "Servidor a inicializar — aguarde alguns segundos")
+                payload = self.read()
+                if not isinstance(payload, dict):
+                    payload = {}
+                initial = str(payload.get("initial") or payload.get("path") or "").strip()
+                title = str(payload.get("title") or "Configurar OneDrive — 06 Pasta da App").strip()
+                chosen = base_mod.pick_folder_dialog(title, initial)
+                if not chosen:
+                    return self.err(400, "Selecao cancelada")
+                from files_service import validate_onedrive_root
+
+                ok, msg = validate_onedrive_root(chosen)
+                return self.json(
+                    {
+                        "path": chosen,
+                        "onedrive_root": chosen,
+                        "ok": True,
+                        "valid": ok,
+                        "message": msg,
+                    }
+                )
             except Exception as e:
                 traceback.print_exc()
                 return self.err(500, str(e))
@@ -6405,6 +8667,18 @@ def _patch_handler_notes_put(Handler, STATE, parse_path, base_mod):
     Handler.do_PUT = do_PUT  # type: ignore[method-assign]
 
 
+def _patch_task_filters(base_mod: Any) -> None:
+    _orig = base_mod.task_filters
+
+    def task_filters(qs):  # noqa: N802
+        f = dict(_orig(qs) or {})
+        one = lambda k, d="": str(((qs.get(k) or [d])[0] or d)).strip()
+        f["show_done"] = one("show_done") in ("1", "true", "True")
+        return f
+
+    base_mod.task_filters = task_filters  # type: ignore[attr-defined]
+
+
 def _patch_load_config(base_mod: Any) -> None:
     """Garante que o .exe encontra config.json do projeto (credenciais SQL)."""
     import json
@@ -6465,6 +8739,7 @@ def _apply_patches(mod: Any) -> None:
     mod.APP_VERSION = APP_VERSION
     mod.HTML = _patch_html(mod.HTML)
     _patch_load_config(mod)
+    _patch_task_filters(mod)
     _patch_pick_folder_dialog(mod)
     _patch_database(mod.Database, mod)
     _patch_handler(mod.Handler, mod.STATE, mod.parse_path, mod.AppError, PermissionError, mod)

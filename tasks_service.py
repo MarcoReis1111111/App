@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from tasks_common import (
     TASK_DB_COLS, TASK_PRIORITIES_DEFAULT, TASK_STATES_DEFAULT, TASK_WRITE_COLS,
-    AppError, ConflictError, TasksDataAccess, can_edit_role, jval, parse_date_iso,
+    AppError, ConflictError, TasksDataAccess, can_edit_role, is_done_estado, jval, parse_date_iso,
     rowver_to_bytes, task_can_edit, task_visible,
 )
 from actions_service import ActionsService
@@ -114,7 +114,7 @@ class TasksService:
         prazo_s = str(d.get("Prazo") or "")[:10]
         today = dt.date.today()
         is_overdue = False
-        if prazo_s and estado != "Concluído":
+        if prazo_s and not is_done_estado(estado):
             try:
                 is_overdue = dt.date.fromisoformat(prazo_s) < today
             except Exception:
@@ -219,6 +219,10 @@ FROM dbo.tasks t ORDER BY t.id;
             return False
         if f.get("overdue_only") and not d.get("is_overdue"):
             return False
+        if not f.get("show_done"):
+            est_f = str(f.get("estado") or "").strip().lower()
+            if est_f not in ("concluído", "concluido") and _estado_is_concluido(estado):
+                return False
         excel_f = f.get("_excel_filters")
         if excel_f and not row_matches_excel_filters(d, excel_f):
             return False
@@ -433,31 +437,53 @@ WHERE COALESCE(kind,'CHECK')=N'ACTION'
 
     def _ensure_all_actions_done(self, conn, task_id: str) -> None:
         cur = conn.cursor()
+        deleted_filter = ""
+        try:
+            cur.execute(
+                "SELECT COUNT(*) FROM sys.columns WHERE object_id=OBJECT_ID('dbo.task_checklist') AND name='is_deleted';"
+            )
+            if int((cur.fetchone() or [0])[0] or 0) > 0:
+                deleted_filter = " AND ISNULL(is_deleted,0)=0"
+        except Exception:
+            pass
         cur.execute(
-            """
-SELECT COALESCE(item_text,''), COALESCE(status,''), COALESCE(done,0)
+            f"""
+SELECT COALESCE(item_text,''), COALESCE(status,''), COALESCE(done,0), COALESCE(kind,'CHECK')
 FROM dbo.task_checklist
-WHERE TaskID=? AND COALESCE(kind,'CHECK')=N'ACTION';
+WHERE TaskID=?{deleted_filter};
 """,
             (task_id,),
         )
         open_actions: List[str] = []
-        for text, status, done in cur.fetchall() or []:
-            if not _action_is_done(status, done):
-                label = str(text or "").strip() or "(sem texto)"
+        open_checks: List[str] = []
+        for text, status, done, kind in cur.fetchall() or []:
+            if _action_is_done(status, done):
+                continue
+            label = str(text or "").strip() or "(sem texto)"
+            if str(kind or "CHECK").strip().upper() == "ACTION":
                 open_actions.append(label)
-        if not open_actions:
+            else:
+                open_checks.append(label)
+        if not open_actions and not open_checks:
             return
-        n = len(open_actions)
-        if n == 1:
-            raise AppError(
-                f"Não pode concluir a tarefa: a ação «{open_actions[0]}» ainda não está concluída."
-            )
-        preview = "», «".join(open_actions[:3])
-        extra = f" (+{n - 3} mais)" if n > 3 else ""
-        raise AppError(
-            f"Não pode concluir a tarefa: existem {n} ações por concluir («{preview}»{extra})."
-        )
+        parts: List[str] = []
+        if open_actions:
+            na = len(open_actions)
+            if na == 1:
+                parts.append(f"1 ação («{open_actions[0]}»)")
+            else:
+                preview = "», «".join(open_actions[:3])
+                extra = f" (+{na - 3} mais)" if na > 3 else ""
+                parts.append(f"{na} ações («{preview}»{extra})")
+        if open_checks:
+            nc = len(open_checks)
+            if nc == 1:
+                parts.append(f"1 check («{open_checks[0]}»)")
+            else:
+                preview = "», «".join(open_checks[:3])
+                extra = f" (+{nc - 3} mais)" if nc > 3 else ""
+                parts.append(f"{nc} checks («{preview}»{extra})")
+        raise AppError(f"Não pode concluir a tarefa: ainda existem {', '.join(parts)} por concluir.")
 
     def get_task_gantt_data(
         self, task_id: str, username: str, display: str, role: str, cfg: Dict[str, Any]

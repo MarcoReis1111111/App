@@ -58,6 +58,22 @@ CREATE TABLE dbo.scheduled_task_instances (
     CONSTRAINT FK_sched_inst_tmpl FOREIGN KEY (template_id)
         REFERENCES dbo.scheduled_task_templates(id)
 );
+IF OBJECT_ID(N'dbo.scheduled_task_ops', N'U') IS NULL
+CREATE TABLE dbo.scheduled_task_ops (
+    id BIGINT IDENTITY(1,1) NOT NULL PRIMARY KEY,
+    ts DATETIME2 NOT NULL CONSTRAINT DF_sched_ops_ts DEFAULT SYSUTCDATETIME(),
+    action NVARCHAR(64) NOT NULL,
+    username NVARCHAR(128) NOT NULL,
+    ok BIT NOT NULL,
+    message NVARCHAR(500) NULL,
+    details_json NVARCHAR(MAX) NULL,
+    template_id BIGINT NULL
+);
+IF NOT EXISTS (
+    SELECT 1 FROM sys.indexes
+    WHERE name = N'IX_sched_ops_ts' AND object_id = OBJECT_ID(N'dbo.scheduled_task_ops')
+)
+CREATE INDEX IX_sched_ops_ts ON dbo.scheduled_task_ops(ts DESC);
 """
 
 
@@ -276,6 +292,8 @@ class ScheduledService:
         row["mode_human"] = MODE_LABELS.get(str(t.get("create_mode") or "").upper(), t.get("create_mode"))
         row["visibility_human"] = VIS_LABELS.get(str(t.get("visibility") or "").upper(), t.get("visibility"))
         row["state_human"] = ste.describe_template_status(t, today, inst)
+        row["state_short"] = ste.describe_template_status_short(t, today, inst)
+        row["is_failed"] = str(row["state_human"] or "").startswith("Falhou")
         row["pending_human"] = "Sim" if t.get("pending_cycle_key") else "—"
         row["can_edit"] = _can_edit(t, username, role)
         row["last_task_id"] = t.get("last_generated_taskid") or (inst or {}).get("task_id")
@@ -759,3 +777,154 @@ class ScheduledService:
                         ),
                     )
         return final_tid
+
+    def append_op(
+        self,
+        action: str,
+        username: str,
+        ok: bool,
+        message: str = "",
+        details: Optional[Dict[str, Any]] = None,
+        template_id: Optional[int] = None,
+        ts: Optional[dt.datetime] = None,
+    ) -> None:
+        tid = int(template_id) if template_id is not None else None
+        if tid is None and isinstance(details, dict) and details.get("template_id"):
+            try:
+                tid = int(details.get("template_id") or 0) or None
+            except Exception:
+                tid = None
+        msg = str(message or "").strip()[:500]
+        det = details or {}
+        details_json = json.dumps(det, ensure_ascii=False) if det else None
+        stamp = ts or dt.datetime.now()
+        with self.da.lock, self.da.connect() as conn:
+            self.ensure_tables(conn)
+            cur = conn.cursor()
+            cur.execute(
+                """
+                INSERT INTO dbo.scheduled_task_ops(ts, action, username, ok, message, details_json, template_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?);
+                """,
+                (stamp, str(action or "").strip()[:64], str(username or "").strip(), 1 if ok else 0, msg, details_json, tid),
+            )
+            conn.commit()
+
+    def list_ops(self, limit: int = 120, jsonl_path: Optional[str] = None) -> List[Dict[str, Any]]:
+        lim = max(1, min(500, int(limit or 120)))
+        with self.da.lock, self.da.connect() as conn:
+            self.ensure_tables(conn)
+            self._maybe_migrate_ops_jsonl(conn, jsonl_path)
+            cur = conn.cursor()
+            cur.execute(
+                """
+                SELECT TOP (?) ts, action, username, ok, message, details_json
+                FROM dbo.scheduled_task_ops
+                ORDER BY id DESC;
+                """,
+                (lim,),
+            )
+            out: List[Dict[str, Any]] = []
+            for r in cur.fetchall() or []:
+                details: Dict[str, Any] = {}
+                raw_det = r[5] if len(r) > 5 else None
+                if raw_det:
+                    try:
+                        parsed = json.loads(str(raw_det))
+                        if isinstance(parsed, dict):
+                            details = parsed
+                    except Exception:
+                        details = {}
+                ts_val = r[0]
+                if isinstance(ts_val, dt.datetime):
+                    ts_s = ts_val.strftime("%Y-%m-%d %H:%M:%S")
+                else:
+                    ts_s = str(ts_val or "").strip()
+                out.append(
+                    {
+                        "ts": ts_s,
+                        "action": str(r[1] or "").strip(),
+                        "user": str(r[2] or "").strip(),
+                        "ok": bool(r[3]),
+                        "message": str(r[4] or "").strip(),
+                        "details": details,
+                    }
+                )
+            return out
+
+    def clear_ops(self) -> None:
+        with self.da.lock, self.da.connect() as conn:
+            self.ensure_tables(conn)
+            cur = conn.cursor()
+            cur.execute("DELETE FROM dbo.scheduled_task_ops;")
+            conn.commit()
+
+    def _maybe_migrate_ops_jsonl(self, conn, jsonl_path: Optional[str]) -> None:
+        if getattr(self, "_ops_jsonl_migrated", False):
+            return
+        self._ops_jsonl_migrated = True
+        path_s = str(jsonl_path or "").strip()
+        if not path_s:
+            return
+        try:
+            from pathlib import Path
+
+            path = Path(path_s)
+            if not path.is_file():
+                return
+            cur = conn.cursor()
+            cur.execute("SELECT COUNT(1) FROM dbo.scheduled_task_ops;")
+            if int(cur.fetchone()[0] or 0) > 0:
+                try:
+                    path.unlink()
+                except Exception:
+                    pass
+                return
+            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            for line in lines:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    obj = json.loads(line)
+                except Exception:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                ts_raw = str(obj.get("ts") or "").strip()
+                ts_val = dt.datetime.now()
+                if ts_raw:
+                    try:
+                        ts_val = dt.datetime.strptime(ts_raw, "%Y-%m-%d %H:%M:%S")
+                    except Exception:
+                        pass
+                details = obj.get("details") if isinstance(obj.get("details"), dict) else {}
+                details_json = json.dumps(details, ensure_ascii=False) if details else None
+                tid = None
+                if details.get("template_id"):
+                    try:
+                        tid = int(details.get("template_id") or 0) or None
+                    except Exception:
+                        tid = None
+                cur.execute(
+                    """
+                    INSERT INTO dbo.scheduled_task_ops(ts, action, username, ok, message, details_json, template_id)
+                    VALUES (?, ?, ?, ?, ?, ?, ?);
+                    """,
+                    (
+                        ts_val,
+                        str(obj.get("action") or "").strip()[:64],
+                        str(obj.get("user") or "").strip(),
+                        1 if bool(obj.get("ok")) else 0,
+                        str(obj.get("message") or "").strip()[:500],
+                        details_json,
+                        tid,
+                    ),
+                )
+            conn.commit()
+            try:
+                path.unlink()
+            except Exception:
+                pass
+        except Exception:
+            pass

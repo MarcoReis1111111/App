@@ -315,3 +315,17 @@ def describe_template_status(
         return f"Na janela — AUTO criará até {_fmt_pt_date(occ)} ({aviso}){last_hint}"
 
     return f"Na janela — confirmar 'Gerar agora' ({aviso}){last_hint}"
+
+
+def describe_template_status_short(
+    template: dict,
+    as_of: date,
+    instance: Optional[dict] = None,
+) -> str:
+    """Etiqueta curta para tabela (primeiro segmento do estado completo)."""
+    full = describe_template_status(template, as_of, instance)
+    if " — " in full:
+        return full.split(" — ", 1)[0].strip()
+    if len(full) > 42:
+        return full[:41].rstrip() + "…"
+    return full

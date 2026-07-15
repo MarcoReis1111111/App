@@ -16,6 +16,7 @@ BOARD_COLUMNS = [
 
 _COLUMN_KEYS = {c["key"] for c in BOARD_COLUMNS}
 _STATE_TO_COLUMN = {"A Fazer": "Não iniciado"}
+_PRIO_ORDER = {"Alta": 0, "Média": 1, "Media": 1, "Baixa": 2}
 
 
 def column_for_estado(estado: str) -> str:
@@ -40,20 +41,58 @@ def due_badge(prazo: str) -> Dict[str, str]:
         return {"text": "", "bg": "", "fg": ""}
 
 
+def _truthy(v: Any) -> bool:
+    return str(v or "").strip().lower() in ("1", "true", "yes", "on")
+
+
+def board_task_filters(filters: Dict[str, Any]) -> Dict[str, Any]:
+    f = dict(filters or {})
+    out: Dict[str, Any] = {
+        "estado": str(f.get("estado") or "Todos"),
+        "prioridade": str(f.get("prioridade") or "Todas"),
+        "projeto": str(f.get("projeto") or "Todos"),
+        "responsavel": str(f.get("responsavel") or "Todos"),
+        "q": str(f.get("q") or "").strip(),
+    }
+    if _truthy(f.get("only_mine")):
+        out["only_mine"] = True
+    if _truthy(f.get("overdue_only")):
+        out["overdue_only"] = True
+    if _truthy(f.get("blocked_only")):
+        out["blocked_only"] = True
+    if _truthy(f.get("show_done")):
+        out["show_done"] = True
+    return out
+
+
+def board_sort_key(card: Dict[str, Any]) -> tuple:
+    overdue_rank = 0 if card.get("is_overdue") else 1
+    prazo = str(card.get("Prazo") or "").strip()
+    prazo_key = prazo if prazo else "9999-12-31"
+    prio = _PRIO_ORDER.get(str(card.get("Prioridade") or "").strip(), 5)
+    return (overdue_rank, prazo_key, prio)
+
+
 def board_card(row: Dict[str, Any]) -> Dict[str, Any]:
     prazo = str(row.get("Prazo") or "")[:10]
+    estado = str(row.get("Estado") or "").strip()
+    blocked_count = int(row.get("blocked_count") or 0)
+    is_blocked = blocked_count > 0 or estado == "Bloqueado"
+    is_overdue = bool(row.get("is_overdue"))
     return {
         "TaskID": row.get("TaskID"),
         "Tarefa": row.get("Tarefa"),
         "Estado": row.get("Estado"),
-        "column": column_for_estado(str(row.get("Estado") or "")),
+        "column": column_for_estado(estado),
         "Responsavel": row.get("Responsavel"),
         "Prioridade": row.get("Prioridade"),
         "Projeto": row.get("Projeto"),
         "Prazo": prazo,
         "NotifEmoji": row.get("NotifEmoji"),
         "Notificacoes": row.get("Notificacoes"),
-        "is_overdue": bool(row.get("is_overdue")),
+        "is_overdue": is_overdue,
+        "is_blocked": is_blocked,
+        "blocked_count": blocked_count,
         "due_badge": due_badge(prazo),
     }
 
@@ -70,45 +109,24 @@ class BoardService:
         role: str,
         cfg: Dict[str, Any],
     ) -> Dict[str, Any]:
-        f = dict(filters or {})
-        rows = self.tasks.list_tasks({}, username, display, role, cfg)
-        estado_f = str(f.get("estado") or "Todos")
-        prio_f = str(f.get("prioridade") or "Todas")
-        proj_f = str(f.get("projeto") or "Todos")
-        resp_f = str(f.get("responsavel") or "Todos")
-        q = str(f.get("q") or "").strip().lower()
-
-        filtered: List[Dict[str, Any]] = []
-        for r in rows:
-            if estado_f != "Todos" and str(r.get("Estado") or "") != estado_f:
-                continue
-            if prio_f not in ("", "Todas") and str(r.get("Prioridade") or "") != prio_f:
-                continue
-            if proj_f != "Todos" and str(r.get("Projeto") or "") != proj_f:
-                continue
-            if resp_f != "Todos" and str(r.get("Responsavel") or "") != resp_f:
-                continue
-            if q:
-                blob = " ".join(
-                    str(r.get(k) or "")
-                    for k in ("TaskID", "Tarefa", "DescricaoNotas", "Responsavel", "Projeto")
-                ).lower()
-                if q not in blob:
-                    continue
-            filtered.append(r)
+        task_f = board_task_filters(filters)
+        rows = self.tasks.list_tasks(task_f, username, display, role, cfg)
 
         columns: Dict[str, List[Dict[str, Any]]] = {c["key"]: [] for c in BOARD_COLUMNS}
-        for r in filtered:
+        for r in rows:
             card = board_card(r)
             col = card["column"]
             columns.setdefault(col, []).append(card)
+
+        for col_key in columns:
+            columns[col_key].sort(key=board_sort_key)
 
         counts = {k: len(v) for k, v in columns.items()}
         return {
             "columns": BOARD_COLUMNS,
             "cards": columns,
             "counts": counts,
-            "total": len(filtered),
+            "total": len(rows),
         }
 
     def move_card(

@@ -41,6 +41,11 @@ def utcnow_iso() -> str:
     return dt.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
+def is_done_estado(estado: Any) -> bool:
+    s = str(estado or "").strip().lower()
+    return s in ("concluído", "concluido")
+
+
 def rowver_to_bytes(rv: Any) -> Optional[bytes]:
     if rv is None:
         return None
@@ -255,7 +260,7 @@ WHERE COALESCE(kind,'CHECK')=N'ACTION' AND COALESCE(status,'')!=N'Concluído';
             emoji_parts.append(emoji_new)
         estado = str(d.get("Estado") or "").strip()
         prazo_s = str(d.get("Prazo") or "")[:10]
-        if prazo_s and estado != "Concluído":
+        if prazo_s and not is_done_estado(estado):
             try:
                 prazo_date = dt.date.fromisoformat(prazo_s)
                 if prazo_date < today:
