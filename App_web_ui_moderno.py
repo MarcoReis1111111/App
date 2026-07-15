@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
 
-APP_VERSION = "0.17.9"
+APP_VERSION = "0.17.11"
 _BASE_DIR = Path(__file__).resolve().parent
 # Robustez de imports para execucao em diferentes PCs/OneDrive.
 # O bytecode base pode importar modulos "soltos" (ex.: excel_filters.py).
@@ -1444,16 +1444,16 @@ _FOLDER_JS = (
 _TASK_COL_PREFS_JS = (
     "const _TASK_COL_LABELS={TaskID:'TaskID',Tarefa:'Tarefa',DescricaoNotas:'Descrição',Milestone:'Milestone',Assunto:'Assunto',"
     "DataRegisto:'Registo',InicioPrevisto:'Início',Responsavel:'Responsável',Workers:'Workers',Estado:'Estado',Prioridade:'Prio.',"
-    "Notificacoes:'Notificações',NotifEmoji:'Notif.',Prazo:'Prazo',Projeto:'Projeto',Linha:'Linha',Maquina:'Máquina',Pasta:'Pasta',"
+    "Notificacoes:'Notificações',NotifEmoji:'Notif.',Prazo:'Prazo',DataConclusao:'Conclusão',Projeto:'Projeto',Linha:'Linha',Maquina:'Máquina',Pasta:'Pasta',"
     "ResultadoInicial:'Resultado inicial',ResultadoFinal:'Resultado final',Links:'Links'};"
-    "const _TASK_COL_DEFAULT=['TaskID','Tarefa','NotifEmoji','Notificacoes','Milestone','Assunto','DataRegisto','Prazo','Responsavel','Workers','Estado','Prioridade'];"
+    "const _TASK_COL_DEFAULT=['TaskID','Tarefa','NotifEmoji','Notificacoes','Milestone','Assunto','DataRegisto','Prazo','Responsavel','Workers','Estado','DataConclusao','Prioridade'];"
     "let _taskColsAll=[..._TASK_COL_DEFAULT],_taskColsVisible=[..._TASK_COL_DEFAULT],_taskColsReady=false,_taskColWidths={},_taskColResize=null,_taskColSaveTimer=null,_taskColMeasureEl=null;"
     "const _TASK_COL_FLEX=new Set(['Tarefa','Assunto','DescricaoNotas','Milestone','Workers','Notificacoes','Projeto','Linha','Pasta','Links','ResultadoInicial','ResultadoFinal']);"
     "function _taskColLabel(c){return _TASK_COL_LABELS[c]||String(c||'')}"
     "function _taskColsNormalize(cols){const base=Array.isArray(_taskColsAll)&&_taskColsAll.length?_taskColsAll:_TASK_COL_DEFAULT;"
     "const out=[];(Array.isArray(cols)?cols:[]).forEach(c=>{const k=String(c||'').trim();if(k&&base.includes(k)&&!out.includes(k))out.push(k)});"
     "return out.length?out:[...base]}"
-    "function _taskColSortable(c){return ['TaskID','Tarefa','Milestone','Assunto','DataRegisto','Prazo','Responsavel','Estado','Prioridade','Notificacoes','InicioPrevisto','Projeto','Linha','Maquina'].includes(c)}"
+    "function _taskColSortable(c){return ['TaskID','Tarefa','Milestone','Assunto','DataRegisto','Prazo','DataConclusao','Responsavel','Estado','Prioridade','Notificacoes','InicioPrevisto','Projeto','Linha','Maquina'].includes(c)}"
     "async function taskColQuickFilter(c,ev){try{if(ev){ev.preventDefault();ev.stopPropagation()}await openExcelFiltersModal();"
     "if($('ef_col'))$('ef_col').value=String(c||'');if(typeof syncExcelDatePanel==='function')syncExcelDatePanel();"
     "if(typeof loadExcelFilterValues==='function')await loadExcelFilterValues()}catch(e){toast(e.message,true)}}"
@@ -1470,7 +1470,7 @@ _TASK_COL_PREFS_JS = (
     "if(c==='Tarefa')return `<td data-col=\"${c}\"><b>${esc(r.Tarefa||'')}</b></td>`;"
     "if(c==='Estado')return `<td data-col=\"${c}\" class=\"status-cell\" title=\"Clique para mudar estado\">${teBadge(r.Estado)}</td>`;"
     "if(c==='Prioridade')return `<td data-col=\"${c}\">${tpBadge(r.Prioridade)}</td>`;"
-    "if(c==='DataRegisto'||c==='Prazo'||c==='InicioPrevisto')return `<td data-col=\"${c}\">${_taskDate(r[c])}</td>`;"
+    "if(c==='DataRegisto'||c==='Prazo'||c==='InicioPrevisto'||c==='DataConclusao')return `<td data-col=\"${c}\">${_taskDate(r[c])}</td>`;"
     "return `<td data-col=\"${c}\">${esc((r&&r[c]!=null)?r[c]:'')}</td>`}"
     "function _taskColsEnsureModal(){if($('task-cols-modal'))return;"
     "document.body.insertAdjacentHTML('beforeend','<div class=\"modal-bg\" id=\"task-cols-modal\" style=\"display:none\">"
@@ -1757,6 +1757,15 @@ def _patch_html_tasks(html: str) -> str:
         1,
     )
     html = html.replace(
+        '<div class="field"><label>Data registo</label><input type="date" id="td_f_data_reg" readonly value="${esc((t.DataRegisto||\'\').slice(0,10))}"></div>'
+        '<div class="field"><label>Início previsto</label>',
+        '<div class="field"><label>Data registo</label><input type="date" id="td_f_data_reg" readonly value="${esc((t.DataRegisto||\'\').slice(0,10))}"></div>'
+        '<div class="field"><label>Data conclusão</label><input type="date" id="td_f_data_conc" readonly '
+        'value="${esc((t.DataConclusao||\'\').slice(0,10))}"></div>'
+        '<div class="field"><label>Início previsto</label>',
+        1,
+    )
+    html = html.replace(
         '<button class="btn" id="td_edit_btn" onclick="editTaskFromDetail()" style="display:none">Editar</button>',
         "",
         1,
@@ -1778,7 +1787,21 @@ def _patch_html_tasks(html: str) -> str:
     )
     html = html.replace(
         "toast('Tarefa guardada');loadTaskDetail(_detailTid);loadTasks()}",
-        "unsavedClear();toast('Tarefa guardada');loadTasks();closeTaskDetail()}",
+        "unsavedClear();toast('Tarefa guardada');closeTaskDetail()}",
+        1,
+    )
+    html = html.replace(
+        "async function openTaskDetail(tid){try{if(!tid)return;_detailTid=tid;await ensureTaskLookups();",
+        "async function openTaskDetail(tid){try{if(!tid)return;"
+        "const _retPage=String(typeof page!=='undefined'&&page?page:'');"
+        "if(_retPage&&_retPage!=='task-detail'){_detailReturnPage=(_retPage==='board')?'board':'tasks'}"
+        "_detailTid=tid;await ensureTaskLookups();",
+        1,
+    )
+    html = html.replace(
+        "function closeTaskDetail(){_detailTid=null;showPage('tasks')}",
+        "function closeTaskDetail(){const ret=(_detailReturnPage==='board')?'board':'tasks';"
+        "_detailTid=null;_detailReturnPage='tasks';showPage(ret)}",
         1,
     )
     html = html.replace(
@@ -1801,7 +1824,9 @@ def _patch_html_tasks(html: str) -> str:
     )
     html = html.replace(
         "let _detailTid=null,_detailData=null;",
-        _TASK_COL_PREFS_JS + _TASK_COL_WIDTH_JS + "renderTasks=_renderTasksBySqlCols;let _detailTid=null,_detailData=null;",
+        _TASK_COL_PREFS_JS
+        + _TASK_COL_WIDTH_JS
+        + "renderTasks=_renderTasksBySqlCols;let _detailTid=null,_detailData=null,_detailReturnPage='tasks';",
         1,
     )
     html = re.sub(
@@ -2448,12 +2473,12 @@ _TP_BADGE_NEW = (
 )
 
 _TASK_COL_CELL_PRAZO_OLD = (
-    "if(c==='DataRegisto'||c==='Prazo'||c==='InicioPrevisto')return `<td data-col=\"${c}\">${_taskDate(r[c])}</td>`;"
+    "if(c==='DataRegisto'||c==='Prazo'||c==='InicioPrevisto'||c==='DataConclusao')return `<td data-col=\"${c}\">${_taskDate(r[c])}</td>`;"
 )
 
 _TASK_COL_CELL_PRAZO_NEW = (
     "if(c==='Prazo')return `<td data-col=\"${c}\">${_taskDueCell(r)}</td>`;"
-    "if(c==='DataRegisto'||c==='InicioPrevisto')return `<td data-col=\"${c}\">${_taskDate(r[c])}</td>`;"
+    "if(c==='DataRegisto'||c==='InicioPrevisto'||c==='DataConclusao')return `<td data-col=\"${c}\">${_taskDate(r[c])}</td>`;"
 )
 
 _RENDER_TASKS_ROW_OLD = (
@@ -3932,6 +3957,7 @@ def _patch_html_task_detail(html: str) -> str:
         "$('td_side_meta').textContent='Workers: '+(t.Workers||'—')+' · Bloqueios: '+(t.blocked_count||0);",
         "$('td_side_meta').innerHTML='<div><b>Estado:</b> '+esc(t.Estado||'—')+'</div>'"
         "+'<div><b>Prazo:</b> '+esc((t.Prazo||'').slice(0,10)||'—')+'</div>'"
+        "+'<div><b>Conclusão:</b> '+esc((t.DataConclusao||'').slice(0,10)||'—')+'</div>'"
         "+'<div><b>Workers:</b> '+esc(t.Workers||'—')+'</div>'"
         "+'<div><b>Bloqueios:</b> '+(t.blocked_count||0)+'</div>'"
         "+(n0((t&&((t.Private??t.private)))||0)?'<div>🔒 Privada</div>':'');"
@@ -6833,6 +6859,13 @@ def _patch_handler(Handler, STATE, parse_path, AppError, PermissionError, base_m
         hidden = set(getattr(base_mod, "_HIDDEN_LEGACY_COLUMNS", set()) or set())
         out = [str(c).strip() for c in cols if str(c).strip() and str(c).strip() not in hidden]
         if out:
+            if "DataConclusao" not in out:
+                if "Estado" in out:
+                    out.insert(out.index("Estado") + 1, "DataConclusao")
+                elif "Prazo" in out:
+                    out.insert(out.index("Prazo") + 1, "DataConclusao")
+                else:
+                    out.append("DataConclusao")
             return out
         return [
             "TaskID",
@@ -6846,6 +6879,7 @@ def _patch_handler(Handler, STATE, parse_path, AppError, PermissionError, base_m
             "Responsavel",
             "Workers",
             "Estado",
+            "DataConclusao",
             "Prioridade",
         ]
 
