@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
 
-APP_VERSION = "0.17.12"
+APP_VERSION = "0.17.14"
 _BASE_DIR = Path(__file__).resolve().parent
 # Robustez de imports para execucao em diferentes PCs/OneDrive.
 # O bytecode base pode importar modulos "soltos" (ex.: excel_filters.py).
@@ -1828,6 +1828,11 @@ def _patch_html_tasks(html: str) -> str:
         "$('tk_total').textContent=k.total??0;$('tk_open').textContent=k.open??0;$('tk_done').textContent=k.done??0;"
         "$('tk_overdue').textContent=k.overdue??0;$('tk_blocked').textContent=k.blocked??0;"
         "if(page==='tasks')$('upd').textContent='Última atualização: '+new Date().toLocaleTimeString('pt-PT')}catch(e){toast(e.message,true)}}",
+        1,
+    )
+    html = html.replace(
+        "const DATE_FILTER_COLS=['DataRegisto','InicioPrevisto','Prazo'];",
+        "const DATE_FILTER_COLS=['DataRegisto','InicioPrevisto','Prazo','DataConclusao'];",
         1,
     )
     html = html.replace(
@@ -4518,6 +4523,8 @@ def _dashboard_efficiency_charts(base_mod: Any, st: Any, q: dict[str, list[str]]
     }
     only_open = _q1(q, "only_open", "") in ("1", "true", "yes", "on")
     display = getattr(st, "display_name", st.username) or st.username
+    # Precisa de concluídas para agregar por DataConclusao (salvo only_open).
+    filters["show_done"] = True
     rows = st.db.list_tasks(filters, st.username, display, st.role) or []
     if only_open:
         rows = [r for r in rows if str(r.get("Estado") or "").strip().lower() not in ("concluído", "concluido")]
@@ -7218,7 +7225,7 @@ def _patch_handler(Handler, STATE, parse_path, AppError, PermissionError, base_m
                 display = getattr(st, "display_name", st.username) or st.username
                 username_l = str(st.username or "").strip().lower()
                 display_l = str(display or "").strip().lower()
-                rows = st.db.list_tasks({}, st.username, display, st.role) or []
+                rows = st.db.list_tasks({"show_done": True}, st.username, display, st.role) or []
                 today = datetime.now().date()
                 week_key = today.isocalendar()[:2]
 
@@ -8743,6 +8750,20 @@ def _patch_task_filters(base_mod: Any) -> None:
     base_mod.task_filters = task_filters  # type: ignore[attr-defined]
 
 
+def _patch_dashboard_filters(base_mod: Any) -> None:
+    """Dashboard (incl. analítico/OTIF) precisa de concluídas com DataConclusao."""
+    _orig = getattr(base_mod, "dashboard_filters", None)
+    if not callable(_orig):
+        return
+
+    def dashboard_filters(qs):  # noqa: N802
+        f = dict(_orig(qs) or {})
+        f["show_done"] = True
+        return f
+
+    base_mod.dashboard_filters = dashboard_filters  # type: ignore[attr-defined]
+
+
 def _patch_load_config(base_mod: Any) -> None:
     """Garante que o .exe encontra config.json do projeto (credenciais SQL)."""
     import json
@@ -8804,6 +8825,7 @@ def _apply_patches(mod: Any) -> None:
     mod.HTML = _patch_html(mod.HTML)
     _patch_load_config(mod)
     _patch_task_filters(mod)
+    _patch_dashboard_filters(mod)
     _patch_pick_folder_dialog(mod)
     _patch_database(mod.Database, mod)
     _patch_handler(mod.Handler, mod.STATE, mod.parse_path, mod.AppError, PermissionError, mod)

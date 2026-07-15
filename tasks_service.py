@@ -248,19 +248,26 @@ FROM dbo.tasks t ORDER BY t.id;
             return False
         if f.get("overdue_only") and not d.get("is_overdue"):
             return False
+        excel_f = f.get("_excel_filters")
         if not f.get("show_done"):
             est_f = str(f.get("estado") or "").strip().lower()
             df = str(f.get("date_field") or "prazo").strip().lower()
             filtering_conclusao = df in ("conclusao", "dataconclusao", "completed", "conclusion") and (
                 bool(f.get("date_from")) or bool(f.get("date_to"))
             )
+            excel_conclusao = False
+            if excel_f:
+                xf = excel_f.get("DataConclusao") or {}
+                excel_conclusao = bool(xf.get("date_op")) or (
+                    xf.get("selected_values") is not None
+                ) or bool(str(xf.get("text_query") or "").strip())
             if (
                 not filtering_conclusao
+                and not excel_conclusao
                 and est_f not in ("concluído", "concluido")
                 and _estado_is_concluido(estado)
             ):
                 return False
-        excel_f = f.get("_excel_filters")
         if excel_f and not row_matches_excel_filters(d, excel_f):
             return False
         if q:
