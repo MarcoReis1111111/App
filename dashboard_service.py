@@ -159,14 +159,27 @@ class DashboardService:
         }
 
     def _mode_analitico(self, data: List[Dict[str, Any]]) -> Dict[str, Any]:
-        durations: List[int] = []
+        durations_plan: List[int] = []
+        durations_real: List[int] = []
+        otif_n = 0
+        closed_n = 0
         for r in data:
             d0 = _parse_date(r.get("DataRegisto"))
             d1 = _parse_date(r.get("Prazo"))
             if d0 and d1 and d1 >= d0:
-                durations.append((d1 - d0).days)
+                durations_plan.append((d1 - d0).days)
+            est = str(r.get("Estado") or "").strip().lower()
+            if est not in ("concluído", "concluido"):
+                continue
+            closed_n += 1
+            conc = _parse_date(r.get("DataConclusao"))
+            if d0 and conc and conc >= d0:
+                durations_real.append((conc - d0).days)
+            if conc and d1:
+                if conc <= d1:
+                    otif_n += 1
         buckets = {"0-7d": 0, "8-14d": 0, "15-30d": 0, "31-60d": 0, "60+d": 0}
-        for n in durations:
+        for n in durations_real or durations_plan:
             if n <= 7:
                 buckets["0-7d"] += 1
             elif n <= 14:
@@ -180,14 +193,26 @@ class DashboardService:
         by_prio = Counter(str(r.get("Prioridade") or "—") for r in data)
         by_milestone = Counter(str(r.get("Milestone") or "(sem milestone)") for r in data)
         top_ms = by_milestone.most_common(10)
-        avg_dur = round(sum(durations) / len(durations), 1) if durations else 0
+        src = durations_real if durations_real else durations_plan
+        avg_dur = round(sum(src) / len(src), 1) if src else 0
+        otif_pct = round((otif_n * 100.0) / closed_n, 1) if closed_n else 0.0
+        dur_title = (
+            "Duração real (registo → conclusão)"
+            if durations_real
+            else "Duração planeada (registo → prazo)"
+        )
         return {
             "mode": "analitico",
-            "kpis": {"avg_duration_days": avg_dur, "with_dates": len(durations)},
+            "kpis": {
+                "avg_duration_days": avg_dur,
+                "with_dates": len(src),
+                "otif_pct": otif_pct,
+                "closed_with_conclusao": len(durations_real),
+            },
             "charts": [
                 {
                     "id": "duration",
-                    "title": "Duração planeada (registo → prazo)",
+                    "title": dur_title,
                     "type": "bar",
                     "x": list(buckets.keys()),
                     "y": list(buckets.values()),

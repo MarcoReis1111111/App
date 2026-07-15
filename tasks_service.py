@@ -222,14 +222,20 @@ FROM dbo.tasks t ORDER BY t.id;
             return False
         if f.get("responsavel") and f["responsavel"] not in ("Todos", "") and responsavel != f["responsavel"]:
             return False
-        if f.get("date_from"):
-            ref = str(d.get("Prazo") or d.get("DataRegisto") or "")[:10]
-            if not ref or ref < f["date_from"]:
-                return False
-        if f.get("date_to"):
-            ref = str(d.get("Prazo") or d.get("DataRegisto") or "")[:10]
-            if not ref or ref > f["date_to"]:
-                return False
+        if f.get("date_from") or f.get("date_to"):
+            field = str(f.get("date_field") or "prazo").strip().lower()
+            if field in ("conclusao", "dataconclusao", "completed", "conclusion"):
+                ref = str(d.get("DataConclusao") or "")[:10]
+            elif field in ("registo", "dataregisto", "created"):
+                ref = str(d.get("DataRegisto") or "")[:10]
+            else:
+                ref = str(d.get("Prazo") or d.get("DataRegisto") or "")[:10]
+            if f.get("date_from"):
+                if not ref or ref < f["date_from"]:
+                    return False
+            if f.get("date_to"):
+                if not ref or ref > f["date_to"]:
+                    return False
         if f.get("only_mine"):
             disp = str(display or "").strip()
             wk = [s.strip() for s in str(d.get("Workers") or "").split(",") if s.strip()]
@@ -244,7 +250,15 @@ FROM dbo.tasks t ORDER BY t.id;
             return False
         if not f.get("show_done"):
             est_f = str(f.get("estado") or "").strip().lower()
-            if est_f not in ("concluído", "concluido") and _estado_is_concluido(estado):
+            df = str(f.get("date_field") or "prazo").strip().lower()
+            filtering_conclusao = df in ("conclusao", "dataconclusao", "completed", "conclusion") and (
+                bool(f.get("date_from")) or bool(f.get("date_to"))
+            )
+            if (
+                not filtering_conclusao
+                and est_f not in ("concluído", "concluido")
+                and _estado_is_concluido(estado)
+            ):
                 return False
         excel_f = f.get("_excel_filters")
         if excel_f and not row_matches_excel_filters(d, excel_f):

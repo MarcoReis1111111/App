@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
 
-APP_VERSION = "0.17.11"
+APP_VERSION = "0.17.12"
 _BASE_DIR = Path(__file__).resolve().parent
 # Robustez de imports para execucao em diferentes PCs/OneDrive.
 # O bytecode base pode importar modulos "soltos" (ex.: excel_filters.py).
@@ -990,7 +990,7 @@ _MY_DAY_PAGE = (
     '<div class="muted" style="margin-bottom:10px">Tarefas onde participa como worker (não responsável principal).</div>'
     '<div id="md_involved_list" class="md-list"><div class="muted">A carregar...</div></div></section>'
     '<section class="card md-card"><div class="md-head"><h3>Resultados da semana</h3><button class="md-link-btn" onclick="showPage(\'tasks\')">Ver todas</button></div>'
-    '<div class="muted" id="md_week_sub" style="margin-bottom:10px">Resumo de tarefas com prazo nesta semana.</div>'
+    '<div class="muted" id="md_week_sub" style="margin-bottom:10px">Conclusões pela data de conclusão nesta semana.</div>'
     '<div id="md_week_list" class="md-list"><div class="muted">A carregar...</div></div></section>'
     "</div>"
     '<section class="card md-quick"><div class="md-head"><h3>Ações rápidas</h3></div>'
@@ -1061,7 +1061,7 @@ _MY_DAY_JS = (
     "<td>${st}</td><td>${_mdEsc(due)} · ${dueB}<div class=\"muted\">${owner}</div></td></tr>`}).join('')+'</tbody></table>'}"
     "function _mdRenderWeek(j){const box=$('md_week_list');if(!box)return;const rows=Array.isArray(j?.week_results)?j.week_results:[];"
     "const d=Number(j?.week_done||0),o=Number(j?.week_open||0),rc=Number(j?.week_recovered||0),im=Number(j?.week_impact||0);"
-    "const sub=$('md_week_sub');if(sub){sub.textContent='Resumo de tarefas com prazo nesta semana. Concluídas: '+d+' · Em aberto: '+o}"
+    "const sub=$('md_week_sub');if(sub){sub.textContent='Conclusões pela data de conclusão nesta semana. Fechadas: '+d+' · Ainda abertas (prazo esta semana): '+o}"
     "const doneRows=rows.filter(r=>!!r.done);"
     "box.innerHTML=`<div class=\"md-week-kpis\">"
     "<div><b>Concluídas</b><span>${d}</span></div>"
@@ -1070,10 +1070,11 @@ _MY_DAY_JS = (
     "if(!doneRows.length){box.innerHTML+='<div class=\"muted\">Sem conclusões nesta semana.</div>';return}"
     "box.innerHTML+='<table class=\"md-table compact\"><thead><tr><th>Tarefa</th><th>Estado</th><th>Resultado</th></tr></thead><tbody>'"
     "+doneRows.map(r=>{const tid=String(r.task_id||'');const title=_mdEsc(r.title||tid||'—');const due=_mdDate(r.due_date);"
-    "const st=_mdStateBadge(r.status||'');const rb=(r.done?'<span class=\"pill md-ok\">Concluída</span>':'<span class=\"pill md-open\">Aberta</span>');"
+    "const conc=_mdDate(r.completed_at);const st=_mdStateBadge(r.status||'');"
+    "const rb=(r.recovered?'<span class=\"pill md-reason\">Recuperada</span>':'<span class=\"pill md-ok\">Concluída</span>');"
     "return `<tr data-tid=\"${_mdEsc(tid)}\" onclick=\"_mdOpenTask(this.dataset.tid)\" title=\"Abrir detalhe\">"
     "<td><b>${title}</b><div class=\"muted\">${_mdEsc(tid)} · ${_mdEsc(r.project||'Sem projeto')}</div></td>"
-    "<td>${st}</td><td>${rb}<div class=\"muted\">Prazo: ${_mdEsc(due)}</div></td></tr>`}).join('')+'</tbody></table>'}"
+    "<td>${st}</td><td>${rb}<div class=\"muted\">Conclusão: ${_mdEsc(conc)} · Prazo: ${_mdEsc(due||'—')}</div></td></tr>`}).join('')+'</tbody></table>'}"
     "function renderMyDay(j){const k=j?.kpis||{};_mdNum('md_k_total',k.my_tasks);_mdNum('md_k_overdue',k.overdue);"
     "_mdNum('md_k_blocked',k.blocked);_mdNum('md_k_due7',k.due_7d);_mdNum('md_k_progress',k.in_progress);_mdNum('md_k_highprio',k.high_priority_open);"
     "_mdSetGreeting();"
@@ -1520,7 +1521,7 @@ _TASK_COL_PREFS_JS = (
 )
 
 _TASK_COL_WIDTH_JS = (
-    "function _taskColMinWidth(c){const m={TaskID:72,NotifEmoji:44,Tarefa:96,Estado:84,Prioridade:68,DataRegisto:84,Prazo:84,InicioPrevisto:84};return m[c]||72}"
+    "function _taskColMinWidth(c){const m={TaskID:72,NotifEmoji:44,Tarefa:96,Estado:84,Prioridade:68,DataRegisto:84,Prazo:84,InicioPrevisto:84,DataConclusao:84};return m[c]||72}"
     "function _taskColMaxWidth(c){const m={TaskID:180,NotifEmoji:70,Tarefa:640,Estado:180,Prioridade:140,Notificacoes:420};return m[c]||420}"
     "function _taskColNormalizeWidths(raw,cols){const out={};const vis=_taskColsNormalize(cols);"
     "if(raw&&typeof raw==='object'){vis.forEach(c=>{const w=parseInt(raw[c],10);if(w>=40&&w<=900)out[c]=w})}return out}"
@@ -1582,22 +1583,29 @@ def _patch_html_tasks(html: str) -> str:
     )
     html = html.replace(
         "blocked:$('tf_blocked')?.checked,involved:$('tf_involved')?.value",
-        "blocked:$('tf_blocked')?.checked,show_done:$('tf_show_done')?.checked,involved:$('tf_involved')?.value",
+        "blocked:$('tf_blocked')?.checked,show_done:$('tf_show_done')?.checked,"
+        "date_field:$('tf_date_field')?.value,involved:$('tf_involved')?.value",
         1,
     )
     html = html.replace(
         "if($('tf_blocked'))$('tf_blocked').checked=!!o.blocked;if(o.involved&&$('tf_involved'))",
-        "if($('tf_blocked'))$('tf_blocked').checked=!!o.blocked;if($('tf_show_done'))$('tf_show_done').checked=!!o.show_done;if(o.involved&&$('tf_involved'))",
+        "if($('tf_blocked'))$('tf_blocked').checked=!!o.blocked;if($('tf_show_done'))$('tf_show_done').checked=!!o.show_done;"
+        "if(o.date_field&&$('tf_date_field'))$('tf_date_field').value=o.date_field;"
+        "if(o.involved&&$('tf_involved'))",
         1,
     )
     html = html.replace(
         "if($('tf_blocked'))$('tf_blocked').checked=false;if($('tf_involved'))$('tf_involved').value='';",
-        "if($('tf_blocked'))$('tf_blocked').checked=false;if($('tf_show_done'))$('tf_show_done').checked=false;if($('tf_involved'))$('tf_involved').value='';",
+        "if($('tf_blocked'))$('tf_blocked').checked=false;if($('tf_show_done'))$('tf_show_done').checked=false;"
+        "if($('tf_date_field'))$('tf_date_field').value='prazo';"
+        "if($('tf_involved'))$('tf_involved').value='';",
         1,
     )
     html = html.replace(
         "if($('tf_blocked')?.checked)p.set('blocked_only','1');const im=$('tf_involved')",
-        "if($('tf_blocked')?.checked)p.set('blocked_only','1');if($('tf_show_done')?.checked)p.set('show_done','1');const im=$('tf_involved')",
+        "if($('tf_blocked')?.checked)p.set('blocked_only','1');if($('tf_show_done')?.checked)p.set('show_done','1');"
+        "if($('tf_date_field')?.value)p.set('date_field',$('tf_date_field').value);"
+        "const im=$('tf_involved')",
         1,
     )
     html = html.replace(
@@ -2266,14 +2274,17 @@ _TASKS_FILTERS_NEW = (
     '<div class="field"><label>Assunto</label><select id="tf_assunto"></select></div>'
     '<div class="field"><label>Linha</label><select id="tf_linha"></select></div>'
     '<div class="field"><label>Máquina</label><select id="tf_maquina"></select></div>'
-    '<div class="field"><label>Prazo de</label><input id="tf_from" type="date"></div>'
-    '<div class="field"><label>Prazo até</label><input id="tf_to" type="date"></div>'
+    '<div class="field"><label>Campo data</label><select id="tf_date_field">'
+    '<option value="prazo">Prazo</option>'
+    '<option value="registo">Registo</option>'
+    '<option value="conclusao">Conclusão</option></select></div>'
+    '<div class="field"><label>De</label><input id="tf_from" type="date"></div>'
+    '<div class="field"><label>Até</label><input id="tf_to" type="date"></div>'
     '<div class="field"><label>Envolvido</label><select id="tf_involved">'
     '<option value="">Todos</option><option value="1">Modo 1 — Responsável</option>'
     '<option value="2">Modo 2 — +Workers</option><option value="3">Modo 3 — +Ações</option></select></div>'
     "</div></section>"
 )
-
 _TASKS_TOOLBAR_OLD = (
     '<div class="toolbar"><button class="btn primary" id="tb_new" onclick="newTask()">＋ Nova</button>'
     '<button class="btn" id="tb_edit" onclick="editTaskSel()" disabled>Editar</button>'
@@ -3055,7 +3066,10 @@ _BOARD_JS = (
     "if(blocked)badges.push(`<span class=\"k-badge k-badge-block\">🚫 Bloqueio${(r.blocked_count||0)>1?' ('+r.blocked_count+')':''}</span>`);"
     "const badgeHtml=badges.length?`<div class=\"k-badges\">${badges.join('')}</div>`:'';"
     "const bits=[r.Responsavel&&`Resp: ${esc(r.Responsavel)}`,r.Prioridade&&`Prio: ${esc(r.Prioridade)}`,r.Projeto&&`Proj: ${esc(r.Projeto)}`].filter(Boolean).join(' | ');"
-    "card.innerHTML=`<div><b>${esc(fmtTid(r.TaskID))}</b> — ${esc(r.Tarefa||'')}</div>${bits?`<div class=\"muted\" style=\"font-size:12px;margin-top:4px\">${bits}</div>`:''}${badgeHtml}"
+    "const conc=String(r.DataConclusao||'').slice(0,10);"
+    "const concLine=(String(r.Estado||'').toLowerCase().startsWith('conclu')&&conc)"
+    "?`<div class=\"muted\" style=\"font-size:12px;margin-top:4px\">Concluída: ${esc(conc)}</div>`:'';"
+    "card.innerHTML=`<div><b>${esc(fmtTid(r.TaskID))}</b> — ${esc(r.Tarefa||'')}</div>${bits?`<div class=\"muted\" style=\"font-size:12px;margin-top:4px\">${bits}</div>`:''}${badgeHtml}${concLine}"
     "${(r.NotifEmoji||r.Notificacoes)?`<div style=\"margin-top:4px\">${esc(r.NotifEmoji||r.Notificacoes)}</div>`:''}"
     "<div style=\"margin-top:8px;display:flex;gap:6px;flex-wrap:wrap;align-items:center\"><button class=\"btn\" style=\"font-size:12px;padding:4px 8px\" type=\"button\">Abrir</button>"
     "<select class=\"k-status-sel\" style=\"font-size:12px;padding:4px 6px;border-radius:6px;border:1px solid #d7dde8\"></select></div>`;"
@@ -4515,31 +4529,38 @@ def _dashboard_efficiency_charts(base_mod: Any, st: Any, q: dict[str, list[str]]
     tids = set(by_tid.keys())
 
     closed_at: dict[str, str] = {}
-    try:
-        with st.db.connect() as conn:
-            cur = conn.execute("SELECT TOP 8000 ts, TaskID, event, details FROM task_history ORDER BY id DESC;")
-            for ts, task_id, event, details in cur.fetchall():
-                tid = str(task_id or "").strip()
-                if not tid or (tids and tid not in tids):
-                    continue
-                blob = (str(event or "") + " " + str(details or "")).lower()
-                if "conclu" not in blob:
-                    continue
-                d = _to_iso_date(ts)
-                if not d:
-                    continue
-                prev = closed_at.get(tid, "")
-                if not prev or d > prev:
-                    closed_at[tid] = d
-    except Exception:
-        closed_at = {}
+    for tid, r in by_tid.items():
+        if str(r.get("Estado") or "").strip().lower() not in ("concluído", "concluido"):
+            continue
+        d = _to_iso_date(r.get("DataConclusao"))
+        if d:
+            closed_at[tid] = d
 
-    if not closed_at:
-        for tid, r in by_tid.items():
-            if str(r.get("Estado") or "").strip().lower() in ("concluído", "concluido"):
-                d = _to_iso_date(r.get("DataRegisto"))
-                if d:
-                    closed_at[tid] = d
+    # Legado: tarefas concluídas sem DataConclusao — tenta history, senão ignora (não usa DataRegisto).
+    missing = [
+        tid
+        for tid, r in by_tid.items()
+        if str(r.get("Estado") or "").strip().lower() in ("concluído", "concluido") and tid not in closed_at
+    ]
+    if missing:
+        try:
+            with st.db.connect() as conn:
+                cur = conn.execute("SELECT TOP 8000 ts, TaskID, event, details FROM task_history ORDER BY id DESC;")
+                for ts, task_id, event, details in cur.fetchall():
+                    tid = str(task_id or "").strip()
+                    if tid not in missing:
+                        continue
+                    blob = (str(event or "") + " " + str(details or "")).lower()
+                    if "conclu" not in blob:
+                        continue
+                    d = _to_iso_date(ts)
+                    if not d:
+                        continue
+                    prev = closed_at.get(tid, "")
+                    if not prev or d > prev:
+                        closed_at[tid] = d
+        except Exception:
+            pass
 
     weeks: dict[str, int] = {}
     for d in closed_at.values():
@@ -4564,7 +4585,7 @@ def _dashboard_efficiency_charts(base_mod: Any, st: Any, q: dict[str, list[str]]
         "charts": [
             {
                 "type": "bar",
-                "title": "Tarefas fechadas por semana (12 sem.)",
+                "title": "Tarefas fechadas por semana (DataConclusao, 12 sem.)",
                 "x": x,
                 "y": y,
             }
@@ -7423,35 +7444,39 @@ def _patch_handler(Handler, STATE, parse_path, AppError, PermissionError, base_m
                 week_open_n = 0
                 week_recovered_n = 0
                 for r in mine:
-                    due = _to_date(r.get("Prazo"))
-                    if not due or due.isocalendar()[:2] != week_key:
-                        continue
                     st_txt = str(r.get("Estado") or "").strip()
                     is_done = not _is_open(st_txt)
-                    was_late = due < today
+                    due = _to_date(r.get("Prazo"))
+                    conc = _to_date(r.get("DataConclusao"))
                     if is_done:
+                        if not conc or conc.isocalendar()[:2] != week_key:
+                            continue
                         week_done_n += 1
-                        if was_late:
+                        recovered = bool(due and conc > due)
+                        if recovered:
                             week_recovered_n += 1
+                        week_results.append(
+                            {
+                                "task_id": str(r.get("TaskID") or "").strip(),
+                                "title": str(r.get("Tarefa") or "").strip(),
+                                "project": str(r.get("Projeto") or "").strip(),
+                                "status": st_txt,
+                                "priority": str(r.get("Prioridade") or "").strip(),
+                                "due_date": due.isoformat() if due else "",
+                                "completed_at": conc.isoformat(),
+                                "done": True,
+                                "recovered": recovered,
+                            }
+                        )
                     else:
-                        week_open_n += 1
-                    week_results.append(
-                        {
-                            "task_id": str(r.get("TaskID") or "").strip(),
-                            "title": str(r.get("Tarefa") or "").strip(),
-                            "project": str(r.get("Projeto") or "").strip(),
-                            "status": st_txt,
-                            "priority": str(r.get("Prioridade") or "").strip(),
-                            "due_date": due.isoformat(),
-                            "done": bool(is_done),
-                        }
-                    )
+                        if due and due.isocalendar()[:2] == week_key:
+                            week_open_n += 1
                 week_results.sort(
                     key=lambda x: (
-                        0 if bool(x.get("done")) else 1,
-                        str(x.get("due_date") or "9999-12-31"),
+                        str(x.get("completed_at") or "0000-00-00"),
                         str(x.get("title") or "").lower(),
-                    )
+                    ),
+                    reverse=True,
                 )
                 week_impact = 0.0
                 def _to_num(v: Any) -> float:
@@ -8708,6 +8733,11 @@ def _patch_task_filters(base_mod: Any) -> None:
         f = dict(_orig(qs) or {})
         one = lambda k, d="": str(((qs.get(k) or [d])[0] or d)).strip()
         f["show_done"] = one("show_done") in ("1", "true", "True")
+        df = one("date_field", "prazo").lower()
+        if df in ("conclusao", "dataconclusao", "completed", "conclusion", "registo", "dataregisto", "created", "prazo"):
+            f["date_field"] = df
+        else:
+            f["date_field"] = "prazo"
         return f
 
     base_mod.task_filters = task_filters  # type: ignore[attr-defined]
