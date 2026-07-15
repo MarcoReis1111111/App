@@ -17,13 +17,15 @@ TASK_STATES_DEFAULT = ("Não iniciado", "A Fazer", "Em Progresso", "Concluído")
 TASK_PRIORITIES_DEFAULT = ("Baixa", "Média", "Alta")
 TASK_DB_COLS = [
     "TaskID", "Tarefa", "DescricaoNotas", "Milestone", "Assunto", "DataRegisto", "InicioPrevisto", "Responsavel",
-    "Estado", "Prioridade", "Prazo", "Projeto", "Linha", "Maquina", "Pasta", "ResultadoInicial", "ResultadoFinal", "Links",
+    "Estado", "Prioridade", "Prazo", "DataConclusao", "Projeto", "Linha", "Maquina", "Pasta",
+    "ResultadoInicial", "ResultadoFinal", "Links",
 ]
 TASK_LIST_COLS = TASK_DB_COLS + [
     "Workers", "Notificacoes", "NotifEmoji", "Private", "CreatedBy",
     "blocked_count", "is_overdue", "is_recent", "updated_at",
 ]
-TASK_WRITE_COLS = [c for c in TASK_DB_COLS if c != "TaskID"]
+# DataConclusao é gerida pelo servidor (stamp ao concluir); não vem do payload do browser.
+TASK_WRITE_COLS = [c for c in TASK_DB_COLS if c not in ("TaskID", "DataConclusao")]
 ACTION_STATUSES = ("Não iniciado", "Em Progresso", "Bloqueado", "Concluído")
 CHECKLIST_KINDS = ("CHECK", "ACTION")
 
@@ -160,6 +162,16 @@ class TasksDataAccess:
         except Exception as ex:
             raise AppError(f"Falha ao ligar ao SQL Server: {ex}") from ex
 
+    def ensure_tasks_data_conclusao(self, conn) -> None:
+        """Garante coluna dbo.tasks.DataConclusao (DATE NULL)."""
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT COUNT(*) FROM sys.columns WHERE object_id=OBJECT_ID('dbo.tasks') AND name='DataConclusao';"
+        )
+        if int((cur.fetchone() or [0])[0] or 0) > 0:
+            return
+        cur.execute("ALTER TABLE dbo.tasks ADD DataConclusao DATE NULL;")
+
     def user_map(self, conn) -> Dict[str, str]:
         try:
             cur = conn.cursor()
@@ -207,6 +219,7 @@ WHERE COALESCE(kind,'CHECK')=N'ACTION' AND COALESCE(status,'')!=N'Concluído';
         return out_w, blocked
 
     def fetch_task_row(self, conn, task_id: str) -> Optional[Dict[str, Any]]:
+        self.ensure_tasks_data_conclusao(conn)
         cols_sql = ", ".join(f"t.[{c}]" for c in TASK_DB_COLS)
         rowver_sql = ""
         try:

@@ -98,12 +98,19 @@ class ArchiveService:
         if not isinstance(task, dict) or not task_id:
             raise AppError("Dados do arquivo inválidos")
         with self.da.lock, self.da.connect() as conn:
+            self.da.ensure_tasks_data_conclusao(conn)
             cur = conn.cursor()
             cur.execute("SELECT 1 FROM dbo.tasks WHERE TaskID=?;", (task_id,))
             if cur.fetchone():
                 raise AppError(f"A tarefa {task_id} já existe")
             cols = list(TASK_DB_COLS)
-            vals = [str(task.get(c) or "") for c in cols]
+            vals = []
+            for c in cols:
+                raw = task.get(c)
+                if c == "DataConclusao" and (raw is None or str(raw).strip() == ""):
+                    vals.append(None)
+                else:
+                    vals.append("" if raw is None else str(raw))
             cur.execute(
                 f"INSERT INTO dbo.tasks ({', '.join(f'[{c}]' for c in cols)}) "
                 f"VALUES ({', '.join(['?'] * len(cols))});",

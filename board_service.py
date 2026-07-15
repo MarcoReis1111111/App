@@ -28,9 +28,26 @@ def column_for_estado(estado: str) -> str:
     return "Não iniciado"
 
 
-def due_badge(prazo: str) -> Dict[str, str]:
+def due_badge(prazo: str, *, estado: str = "", data_conclusao: str = "") -> Dict[str, str]:
+    """Badge de prazo. Em Concluído: mostra conclusão / atraso no fecho, nunca atraso activo."""
+    st = str(estado or "").strip().lower()
+    done = st in ("concluído", "concluido")
+    conc_s = str(data_conclusao or "").strip()[:10]
+    prazo_s = str(prazo or "").strip()[:10]
+    if done:
+        try:
+            c = dt.date.fromisoformat(conc_s) if conc_s else None
+            d = dt.date.fromisoformat(prazo_s) if prazo_s else None
+            if c and d and c > d:
+                lag = (c - d).days
+                return {"text": f"Fechada +{lag}d", "bg": "#FEF3C7", "fg": "#92400E"}
+            if c:
+                return {"text": f"Concluída {c.isoformat()[5:]}", "bg": "#DCFCE7", "fg": "#166534"}
+            return {"text": "Concluída", "bg": "#DCFCE7", "fg": "#166534"}
+        except Exception:
+            return {"text": "Concluída", "bg": "#DCFCE7", "fg": "#166534"}
     try:
-        d = dt.date.fromisoformat(str(prazo or "")[:10])
+        d = dt.date.fromisoformat(prazo_s)
         delta = (d - dt.date.today()).days
         if delta < 0:
             return {"text": f"Atraso ({abs(delta)}d)", "bg": "#FEE2E2", "fg": "#7A1E2D"}
@@ -76,6 +93,7 @@ def board_sort_key(card: Dict[str, Any]) -> tuple:
 def board_card(row: Dict[str, Any]) -> Dict[str, Any]:
     prazo = str(row.get("Prazo") or "")[:10]
     estado = str(row.get("Estado") or "").strip()
+    data_conc = str(row.get("DataConclusao") or "")[:10]
     blocked_count = int(row.get("blocked_count") or 0)
     is_blocked = blocked_count > 0 or estado == "Bloqueado"
     is_overdue = bool(row.get("is_overdue"))
@@ -88,12 +106,13 @@ def board_card(row: Dict[str, Any]) -> Dict[str, Any]:
         "Prioridade": row.get("Prioridade"),
         "Projeto": row.get("Projeto"),
         "Prazo": prazo,
+        "DataConclusao": data_conc,
         "NotifEmoji": row.get("NotifEmoji"),
         "Notificacoes": row.get("Notificacoes"),
         "is_overdue": is_overdue,
         "is_blocked": is_blocked,
         "blocked_count": blocked_count,
-        "due_badge": due_badge(prazo),
+        "due_badge": due_badge(prazo, estado=estado, data_conclusao=data_conc),
     }
 
 
