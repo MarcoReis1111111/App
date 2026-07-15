@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
 
-APP_VERSION = "0.17.9"
+APP_VERSION = "0.17.10"
 _BASE_DIR = Path(__file__).resolve().parent
 # Robustez de imports para execucao em diferentes PCs/OneDrive.
 # O bytecode base pode importar modulos "soltos" (ex.: excel_filters.py).
@@ -1778,7 +1778,21 @@ def _patch_html_tasks(html: str) -> str:
     )
     html = html.replace(
         "toast('Tarefa guardada');loadTaskDetail(_detailTid);loadTasks()}",
-        "unsavedClear();toast('Tarefa guardada');loadTasks();closeTaskDetail()}",
+        "unsavedClear();toast('Tarefa guardada');closeTaskDetail()}",
+        1,
+    )
+    html = html.replace(
+        "async function openTaskDetail(tid){try{if(!tid)return;_detailTid=tid;await ensureTaskLookups();",
+        "async function openTaskDetail(tid){try{if(!tid)return;"
+        "const _retPage=String(typeof page!=='undefined'&&page?page:'');"
+        "if(_retPage&&_retPage!=='task-detail'){_detailReturnPage=(_retPage==='board')?'board':'tasks'}"
+        "_detailTid=tid;await ensureTaskLookups();",
+        1,
+    )
+    html = html.replace(
+        "function closeTaskDetail(){_detailTid=null;showPage('tasks')}",
+        "function closeTaskDetail(){const ret=(_detailReturnPage==='board')?'board':'tasks';"
+        "_detailTid=null;_detailReturnPage='tasks';showPage(ret)}",
         1,
     )
     html = html.replace(
@@ -1801,7 +1815,9 @@ def _patch_html_tasks(html: str) -> str:
     )
     html = html.replace(
         "let _detailTid=null,_detailData=null;",
-        _TASK_COL_PREFS_JS + _TASK_COL_WIDTH_JS + "renderTasks=_renderTasksBySqlCols;let _detailTid=null,_detailData=null;",
+        _TASK_COL_PREFS_JS
+        + _TASK_COL_WIDTH_JS
+        + "renderTasks=_renderTasksBySqlCols;let _detailTid=null,_detailData=null,_detailReturnPage='tasks';",
         1,
     )
     html = re.sub(
