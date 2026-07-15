@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional, Set
 
 EXCEL_FILTER_COLS = [
     "TaskID", "Tarefa", "DescricaoNotas", "Milestone", "Assunto", "DataRegisto", "InicioPrevisto",
-    "Responsavel", "Workers", "Estado", "Prioridade", "Notificacoes", "NotifEmoji", "Prazo",
+    "Responsavel", "Workers", "Estado", "Prioridade", "Notificacoes", "NotifEmoji", "Prazo", "DataConclusao",
     "Projeto", "Linha", "Maquina", "Pasta", "ResultadoInicial", "ResultadoFinal", "Links",
 ]
 
@@ -64,7 +64,7 @@ def excel_filters_active(filters: Dict[str, Dict[str, Any]]) -> bool:
             return True
         if str(f.get("text_query") or "").strip():
             return True
-        if col in ("DataRegisto", "Prazo", "InicioPrevisto") and f.get("date_op"):
+        if col in ("DataRegisto", "Prazo", "InicioPrevisto", "DataConclusao") and f.get("date_op"):
             return True
     return False
 
@@ -157,7 +157,7 @@ def row_matches_excel_filters(row: Dict[str, Any], filters: Dict[str, Dict[str, 
         if f.get("text_query"):
             if not _text_matches(cell, f.get("text_op"), f.get("text_query")):
                 return False
-        if col in ("DataRegisto", "Prazo", "InicioPrevisto") and f.get("date_op"):
+        if col in ("DataRegisto", "Prazo", "InicioPrevisto", "DataConclusao") and f.get("date_op"):
             if not _date_matches(cell, f.get("date_op"), f.get("date_a"), f.get("date_b")):
                 return False
     return True

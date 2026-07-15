@@ -55,6 +55,22 @@ def _estado_is_concluido(estado: Any) -> bool:
     return s in ("concluído", "concluido")
 
 
+def _conclusao_stamp_for_transition(prev_estado: Any, new_estado: Any, today: str) -> Optional[str]:
+    """
+    Retorna a data a gravar em DataConclusao, ou None para limpar.
+    - Ao entrar em Concluído: grava `today` (última conclusão).
+    - Ao sair de Concluído: limpa (NULL).
+    - Sem transição: None especial via sentinel — use tuple.
+    """
+    prev_done = _estado_is_concluido(prev_estado)
+    new_done = _estado_is_concluido(new_estado)
+    if new_done and not prev_done:
+        return today
+    if (not new_done) and prev_done:
+        return ""
+    return None  # sem alteração
+
+
 def _action_is_done(status: Any, done: Any = 0) -> bool:
     st = str(status or "").strip().lower()
     if st in ("concluído", "concluido"):
@@ -138,6 +154,8 @@ class TasksService:
         rowver_sql = ""
         try:
             with self.da.connect() as conn:
+                self.da.ensure_tasks_data_conclusao(conn)
+                conn.commit()
                 cur0 = conn.cursor()
                 cur0.execute(
                     "SELECT COUNT(*) FROM sys.columns WHERE object_id=OBJECT_ID('dbo.tasks') AND name='RowVer';"
@@ -152,6 +170,11 @@ SELECT {cols_sql}, COALESCE(t.Private,0), COALESCE(t.CreatedBy,N''),
 FROM dbo.tasks t ORDER BY t.id;
 """
         with self.da.connect() as conn:
+            try:
+                self.da.ensure_tasks_data_conclusao(conn)
+                conn.commit()
+            except Exception:
+                pass
             wmap, blocked = self.da.workers_blocked_maps(conn)
             cur = conn.cursor()
             cur.execute(sql)
@@ -572,6 +595,7 @@ WHERE TaskID=?{deleted_filter};
         vals = [tmp_tid] + [v.get(c, "") for c in TASK_WRITE_COLS]
         with self.da.lock, self.da.connect() as conn:
             cur = conn.cursor()
+            self.da.ensure_tasks_data_conclusao(conn)
             cur.execute(
                 f"INSERT INTO dbo.tasks ({', '.join(insert_cols)}) OUTPUT INSERTED.id VALUES ({', '.join(['?'] * len(insert_cols))});",
                 vals,
@@ -581,6 +605,9 @@ WHERE TaskID=?{deleted_filter};
             final_tid = f"Task_{ts}_N{new_id}"
             cur.execute("UPDATE dbo.tasks SET TaskID=? WHERE id=?;", (final_tid, new_id))
             cur.execute("UPDATE dbo.tasks SET Private=?, CreatedBy=? WHERE id=?;", (int(v.get("Private") or 0), username, new_id))
+            if _estado_is_concluido(v.get("Estado")):
+                today = dt.date.today().isoformat()
+                cur.execute("UPDATE dbo.tasks SET DataConclusao=? WHERE id=?;", (today, new_id))
             self.da.add_task_history(conn, final_tid, username, "create", f"Tarefa criada: {v.get('Tarefa', '')}")
             conn.commit()
             return final_tid
@@ -606,6 +633,7 @@ WHERE TaskID=?{deleted_filter};
         v = clean_task_payload(raw)
         validate_task_save(v)
         with self.da.lock, self.da.connect() as conn:
+            self.da.ensure_tasks_data_conclusao(conn)
             row = self.da.fetch_task_row(conn, tid)
             if not row:
                 raise AppError("Tarefa não encontrada")
@@ -633,11 +661,23 @@ WHERE TaskID=?{deleted_filter};
                 "UPDATE dbo.tasks SET Private=?, CreatedBy=? WHERE TaskID=?;",
                 (int(v.get("Private") or 0), row.get("CreatedBy") or username, tid),
             )
+            today = dt.date.today().isoformat()
+            stamp = _conclusao_stamp_for_transition(prev_estado, new_estado, today)
+            if stamp is not None:
+                if stamp == "":
+                    cur.execute("UPDATE dbo.tasks SET DataConclusao=NULL WHERE TaskID=?;", (tid,))
+                else:
+                    cur.execute("UPDATE dbo.tasks SET DataConclusao=? WHERE TaskID=?;", (stamp, tid))
+                    self.da.add_task_history(
+                        conn, tid, username, "change", f"Data conclusão: {stamp}"
+                    )
             if prev_estado.strip() != "Concluído" and new_estado.strip() == "Concluído":
                 try:
                     arch_row = dict(row)
                     arch_row.update(v)
                     arch_row["Estado"] = new_estado
+                    if stamp:
+                        arch_row["DataConclusao"] = stamp
                     self.archive.archive_conn(conn, tid, "completed", username, arch_row)
                 except Exception:
                     pass
