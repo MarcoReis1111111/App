@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
 
-APP_VERSION = "0.17.15"
+APP_VERSION = "0.17.16"
 _BASE_DIR = Path(__file__).resolve().parent
 # Robustez de imports para execucao em diferentes PCs/OneDrive.
 # O bytecode base pode importar modulos "soltos" (ex.: excel_filters.py).
@@ -896,9 +896,11 @@ def _patch_html(html: str) -> str:
                             _patch_html_diagnostics(
                                 _patch_html_task_detail(
                                     _patch_html_achievements(
-                                        _patch_html_board(
-                                            _patch_html_scheduled(
-                                                _patch_html_my_day(_patch_html_notes(_patch_html_tasks(html)))
+                                        _patch_html_dashboard(
+                                            _patch_html_board(
+                                                _patch_html_scheduled(
+                                                    _patch_html_my_day(_patch_html_notes(_patch_html_tasks(html)))
+                                                )
                                             )
                                         )
                                     )
@@ -2904,7 +2906,7 @@ def _patch_html_dashboard(html: str) -> str:
         '<div class="grid db-grid">'
         '<div class="field"><label>Modo</label><select id="db_mode" onchange="loadDashboard()"><option value="executivo">Executivo</option><option value="operacao">Operação</option><option value="analitico">Analítico</option><option value="eficiencia">Eficiência</option></select></div>'
         '<div class="field"><label>Estado</label><select id="db_estado_f" onchange="loadDashboard()"><option>Todos</option></select></div>'
-        '<div class="field"><label>Prioridade</label><select id="db_prio_f" onchange="loadDashboard()"><option>Todos</option></select></div>'
+        '<div class="field"><label>Prioridade</label><select id="db_prio_f" onchange="loadDashboard()"><option>Todas</option></select></div>'
         '<div class="field"><label>Responsável</label><select id="db_resp_f" onchange="loadDashboard()"><option>Todos</option></select></div>'
         '<div class="field"><label>Projeto</label><select id="db_proj_f" onchange="loadDashboard()"><option>Todos</option></select></div>'
         '<div class="field db-open"><label><input type="checkbox" id="db_only_open" onchange="loadDashboard()"> Só abertas</label></div>'
@@ -2923,7 +2925,7 @@ def _patch_html_dashboard(html: str) -> str:
         "const l=(Array.isArray(c?.labels)?c.labels:Array.isArray(c?.y)?c.y:Array.isArray(c?.x)?c.x:[]).slice(0,6).map(x=>String(x||'')).join('|').toLowerCase();"
         "return ty+'|'+t+'|'+l}"
         "function dbFilterSummary(){const pairs=[['Modo','db_mode'],['Estado','db_estado_f'],['Prioridade','db_prio_f'],['Responsável','db_resp_f'],['Projeto','db_proj_f']];"
-        "const out=[];pairs.forEach(([k,id])=>{const v=$(id)?.value;if(v&&v!=='Todos')out.push(k+': '+v)});if($('db_only_open')?.checked)out.push('Só abertas');return out.join(' · ')||'Sem filtros adicionais'}"
+        "const out=[];pairs.forEach(([k,id])=>{const v=$(id)?.value;if(v&&v!=='Todos'&&v!=='Todas')out.push(k+': '+v)});if($('db_only_open')?.checked)out.push('Só abertas');return out.join(' · ')||'Sem filtros adicionais'}"
         "async function loadDashboardPrefs(){if(_dbPrefsLoaded)return;try{let j=await api('/api/dashboard/prefs');const p=j?.prefs||{};"
         "if($('db_mode')&&p.mode)$('db_mode').value=p.mode;if($('db_estado_f')&&p.estado)$('db_estado_f').value=p.estado;"
         "if($('db_prio_f')&&p.prioridade)$('db_prio_f').value=(p.prioridade==='Todos'?'Todas':p.prioridade);"
@@ -4522,10 +4524,13 @@ def _dashboard_efficiency_charts(base_mod: Any, st: Any, q: dict[str, list[str]]
     filters = {
         "q": _q1(q, "q", ""),
         "estado": _q1(q, "estado", "Todos"),
-        "prioridade": _q1(q, "prioridade", "Todos"),
+        "prioridade": _q1(q, "prioridade", "Todas"),
         "responsavel": _q1(q, "responsavel", "Todos"),
         "projeto": _q1(q, "projeto", "Todos"),
     }
+    # Aceitar legado "Todos" no filtro de prioridade (UI antiga / prefs).
+    if str(filters.get("prioridade") or "") == "Todos":
+        filters["prioridade"] = "Todas"
     only_open = _q1(q, "only_open", "") in ("1", "true", "yes", "on")
     display = getattr(st, "display_name", st.username) or st.username
     # Precisa de concluídas para agregar por DataConclusao (salvo only_open).
