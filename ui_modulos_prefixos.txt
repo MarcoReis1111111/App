@@ -1,0 +1,41 @@
+Prefixos de módulos UI (App Engenharia)
+=======================================
+Convenção acordada: cada separador/área usa um prefixo fixo.
+Pode haver 1 ficheiro ou vários — todos com o mesmo início no nome.
+Reorganizar aos poucos, só quando houver melhoria nessa área.
+NÃO renomear os *_service.py existentes nesta fase.
+
+Entrada principal (mantém-se)
+  App_web_ui_moderno.py     — importa e liga os módulos
+
+Separadores / ecrãs
+  boot_           Iniciação / arranque (load base, patches, config)
+  home_           Home
+  myday_          O Meu Dia
+  tasks_          Tarefas (tabela)
+  taskdetail_     Detalhe da tarefa
+  board_          Board / Kanban
+  dashboard_      Dashboard
+  achievements_   Tabela das boas / Conquistas
+  scheduled_      Agendadas
+  project_        Projeto / Gantt
+  notes_          Notas
+  shortcuts_      Atalhos
+  contacts_       Contactos
+  machines_       Máquinas
+  system_         Sistema / Listas
+  diagnostics_    Diagnósticos
+  admin_          Admin
+  auth_           Login / Auth
+
+Partilhado (não é separador)
+  shell_          Nav, ordem dos menus, CSS/estabilidade global
+
+Exemplos
+  myday_html.py + myday_api.py
+  tasks_html.py + tasks_routes.py
+  achievements_html.py
+
+Serviços SQL (já existem — não renomear agora)
+  tasks_service, board_service, dashboard_service, scheduled_service,
+  notes_service, archive_service, actions_service, …
