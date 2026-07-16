@@ -66,13 +66,13 @@ FROM dbo.task_checklist WHERE TaskID=?{kind_filter} ORDER BY ord, id;
                 due_s = str(d.get("due_date") or "")[:10]
                 st = str(d.get("status") or "")
                 d["is_overdue"] = False
-                if due_s and st != "Concluído":
+                if due_s and not (st.strip().lower() in ("concluído", "concluido") or bool(int(d.get("done") or 0))):
                     try:
                         d["is_overdue"] = dt.date.fromisoformat(due_s) < today
                     except Exception:
                         pass
                 d["is_blocked"] = st == "Bloqueado"
-                d["is_done"] = bool(int(d.get("done") or 0)) or st == "Concluído"
+                d["is_done"] = bool(int(d.get("done") or 0)) or st.strip().lower() in ("concluído", "concluido")
                 out.append(d)
             return out
 
@@ -97,7 +97,9 @@ FROM dbo.task_checklist WHERE TaskID=?{kind_filter} ORDER BY ord, id;
                 cur.execute("""
 SELECT MAX(COALESCE(due_date,'')) FROM dbo.task_checklist
 WHERE TaskID=? AND COALESCE(kind,'CHECK')=N'ACTION'
-  AND COALESCE(status,'')!=N'Concluído' AND COALESCE(due_date,'')<>'';
+  AND COALESCE(done,0)=0
+  AND LOWER(COALESCE(status,'')) NOT IN (N'concluído', N'concluido')
+  AND COALESCE(due_date,'')<>'';
 """, (tid,))
                 row = cur.fetchone()
                 if row and row[0]:
