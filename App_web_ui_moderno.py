@@ -26,7 +26,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import unquote
 
-APP_VERSION = "0.17.14"
+APP_VERSION = "0.17.16"
 _BASE_DIR = Path(__file__).resolve().parent
 # Robustez de imports para execucao em diferentes PCs/OneDrive.
 # O bytecode base pode importar modulos "soltos" (ex.: excel_filters.py).
@@ -896,9 +896,11 @@ def _patch_html(html: str) -> str:
                             _patch_html_diagnostics(
                                 _patch_html_task_detail(
                                     _patch_html_achievements(
-                                        _patch_html_board(
-                                            _patch_html_scheduled(
-                                                _patch_html_my_day(_patch_html_notes(_patch_html_tasks(html)))
+                                        _patch_html_dashboard(
+                                            _patch_html_board(
+                                                _patch_html_scheduled(
+                                                    _patch_html_my_day(_patch_html_notes(_patch_html_tasks(html)))
+                                                )
                                             )
                                         )
                                     )
@@ -1020,7 +1022,7 @@ _MY_DAY_JS = (
     "function _mdStateBadge(st){const s=String(st||'').trim();"
     "const cls=s.toLowerCase().includes('bloque')?'bad':(s.toLowerCase().includes('progres')?'warn':'');"
     "return `<span class=\"md-state ${cls}\">${_mdEsc(s||'—')}</span>`}"
-    "function _mdOpenTask(tid){if(!tid)return;showPage('tasks');setTimeout(()=>openTaskDetail(tid),0)}"
+    "function _mdOpenTask(tid){if(!tid)return;openTaskDetail(tid)}"
     "function _mdRenderDue7(j){const box=$('md_due7_list');if(!box)return;const rows=Array.isArray(j?.due_next_7)?j.due_next_7:[];"
     "if(!rows.length){box.innerHTML='<div class=\"muted\">Sem prazos nos próximos 7 dias.</div>';return}"
     "box.innerHTML='<table class=\"md-table compact\"><thead><tr><th>Tarefa</th><th>Estado</th><th>Prazo</th><th>Janela</th></tr></thead><tbody>'"
@@ -1802,13 +1804,15 @@ def _patch_html_tasks(html: str) -> str:
         "async function openTaskDetail(tid){try{if(!tid)return;_detailTid=tid;await ensureTaskLookups();",
         "async function openTaskDetail(tid){try{if(!tid)return;"
         "const _retPage=String(typeof page!=='undefined'&&page?page:'');"
-        "if(_retPage&&_retPage!=='task-detail'){_detailReturnPage=(_retPage==='board')?'board':'tasks'}"
+        "if(_retPage&&_retPage!=='task-detail'){"
+        "const _allowed=['board','myday','dashboard','tasks','ach','project','scheduled','home','notes'];"
+        "_detailReturnPage=_allowed.includes(_retPage)?_retPage:'tasks'}"
         "_detailTid=tid;await ensureTaskLookups();",
         1,
     )
     html = html.replace(
         "function closeTaskDetail(){_detailTid=null;showPage('tasks')}",
-        "function closeTaskDetail(){const ret=(_detailReturnPage==='board')?'board':'tasks';"
+        "function closeTaskDetail(){const ret=_detailReturnPage||'tasks';"
         "_detailTid=null;_detailReturnPage='tasks';showPage(ret)}",
         1,
     )
@@ -2902,7 +2906,7 @@ def _patch_html_dashboard(html: str) -> str:
         '<div class="grid db-grid">'
         '<div class="field"><label>Modo</label><select id="db_mode" onchange="loadDashboard()"><option value="executivo">Executivo</option><option value="operacao">Operação</option><option value="analitico">Analítico</option><option value="eficiencia">Eficiência</option></select></div>'
         '<div class="field"><label>Estado</label><select id="db_estado_f" onchange="loadDashboard()"><option>Todos</option></select></div>'
-        '<div class="field"><label>Prioridade</label><select id="db_prio_f" onchange="loadDashboard()"><option>Todos</option></select></div>'
+        '<div class="field"><label>Prioridade</label><select id="db_prio_f" onchange="loadDashboard()"><option>Todas</option></select></div>'
         '<div class="field"><label>Responsável</label><select id="db_resp_f" onchange="loadDashboard()"><option>Todos</option></select></div>'
         '<div class="field"><label>Projeto</label><select id="db_proj_f" onchange="loadDashboard()"><option>Todos</option></select></div>'
         '<div class="field db-open"><label><input type="checkbox" id="db_only_open" onchange="loadDashboard()"> Só abertas</label></div>'
@@ -2921,20 +2925,23 @@ def _patch_html_dashboard(html: str) -> str:
         "const l=(Array.isArray(c?.labels)?c.labels:Array.isArray(c?.y)?c.y:Array.isArray(c?.x)?c.x:[]).slice(0,6).map(x=>String(x||'')).join('|').toLowerCase();"
         "return ty+'|'+t+'|'+l}"
         "function dbFilterSummary(){const pairs=[['Modo','db_mode'],['Estado','db_estado_f'],['Prioridade','db_prio_f'],['Responsável','db_resp_f'],['Projeto','db_proj_f']];"
-        "const out=[];pairs.forEach(([k,id])=>{const v=$(id)?.value;if(v&&v!=='Todos')out.push(k+': '+v)});if($('db_only_open')?.checked)out.push('Só abertas');return out.join(' · ')||'Sem filtros adicionais'}"
+        "const out=[];pairs.forEach(([k,id])=>{const v=$(id)?.value;if(v&&v!=='Todos'&&v!=='Todas')out.push(k+': '+v)});if($('db_only_open')?.checked)out.push('Só abertas');return out.join(' · ')||'Sem filtros adicionais'}"
         "async function loadDashboardPrefs(){if(_dbPrefsLoaded)return;try{let j=await api('/api/dashboard/prefs');const p=j?.prefs||{};"
-        "if($('db_mode')&&p.mode)$('db_mode').value=p.mode;if($('db_estado_f')&&p.estado)$('db_estado_f').value=p.estado;if($('db_prio_f')&&p.prioridade)$('db_prio_f').value=p.prioridade;"
+        "if($('db_mode')&&p.mode)$('db_mode').value=p.mode;if($('db_estado_f')&&p.estado)$('db_estado_f').value=p.estado;"
+        "if($('db_prio_f')&&p.prioridade)$('db_prio_f').value=(p.prioridade==='Todos'?'Todas':p.prioridade);"
         "if($('db_resp_f')&&p.responsavel)$('db_resp_f').value=p.responsavel;if($('db_proj_f')&&p.projeto)$('db_proj_f').value=p.projeto;if($('db_only_open'))$('db_only_open').checked=!!p.only_open}catch(_){ }_dbPrefsLoaded=true}"
-        "async function saveDashboardPrefs(){try{await api('/api/dashboard/prefs',{method:'POST',body:JSON.stringify({mode:$('db_mode')?.value||'executivo',estado:$('db_estado_f')?.value||'Todos',prioridade:$('db_prio_f')?.value||'Todos',responsavel:$('db_resp_f')?.value||'Todos',projeto:$('db_proj_f')?.value||'Todos',only_open:!!$('db_only_open')?.checked})})}catch(_){}}"
+        "async function saveDashboardPrefs(){try{await api('/api/dashboard/prefs',{method:'POST',body:JSON.stringify({mode:$('db_mode')?.value||'executivo',estado:$('db_estado_f')?.value||'Todos',prioridade:$('db_prio_f')?.value||'Todas',responsavel:$('db_resp_f')?.value||'Todos',projeto:$('db_proj_f')?.value||'Todos',only_open:!!$('db_only_open')?.checked})})}catch(_){}}"
         "async function loadDashboard(){try{await ensureTaskLookups();populateDbFilters();await loadDashboardPrefs();"
         "let j=await api('/api/dashboard/summary'+dbQs());const tk=j.tasks||{},ak=j.achievements||{};$('db_tk_total').textContent=tk.total??0;$('db_tk_open').textContent=tk.open??0;"
         "$('db_tk_overdue').textContent=tk.overdue??0;$('db_ach_total').textContent=ak.total??0;$('db_ach_impact').textContent=money(ak.impact_total||0);"
         "if($('db_ach_impact_sub'))$('db_ach_impact_sub').textContent=String(ak.scope_label||'Segundo filtros ativos');"
         "let ch=await api('/api/dashboard/charts'+dbQs());renderDbCharts(ch);saveDashboardPrefs();"
         "if(page==='dashboard')$('upd').textContent='Última atualização: '+new Date().toLocaleTimeString('pt-PT')}catch(e){toast(e.message,true)}}"
-        "function populateDbFilters(){const tl=_taskLookups||{};const prep=(a,d)=>[d,...new Set((a||[]).filter(x=>x&&x!==d))];if($('db_estado_f')&&!$('db_estado_f').dataset.filled){fill('db_estado_f',prep(tl.estados,'Todos'));fill('db_prio_f',['Todos','Alta','Média','Baixa']);fill('db_resp_f',prep(tl.users,'Todos'));fill('db_proj_f',prep(tl.projects,'Todos'));$('db_estado_f').dataset.filled='1'}}"
-        "function dbQs(){const q=new URLSearchParams();q.set('mode',$('db_mode')?.value||'executivo');[['estado','db_estado_f','Todos'],['prioridade','db_prio_f','Todos'],['responsavel','db_resp_f','Todos'],['projeto','db_proj_f','Todos']].forEach(([k,id,d])=>{const v=$(id)?.value;if(v&&v!==d)q.set(k,v)});if($('db_only_open')?.checked)q.set('only_open','1');return '?'+q.toString()}"
-        "function dbApplyTaskFilters(extra={}){if($('tf_q'))$('tf_q').value='';if($('tf_estado'))$('tf_estado').value=extra.estado||'Todos';if($('tf_prio'))$('tf_prio').value=extra.prioridade||'Todos';if($('tf_resp'))$('tf_resp').value=extra.responsavel||'Todos';if($('tf_projeto'))$('tf_projeto').value=extra.projeto||'Todos';"
+        "function populateDbFilters(){const tl=_taskLookups||{};const prep=(a,d)=>[d,...new Set((a||[]).filter(x=>x&&x!==d))];if($('db_estado_f')&&!$('db_estado_f').dataset.filled){fill('db_estado_f',prep(tl.estados,'Todos'));fill('db_prio_f',['Todas','Alta','Média','Baixa']);fill('db_resp_f',prep(tl.users,'Todos'));fill('db_proj_f',prep(tl.projects,'Todos'));$('db_estado_f').dataset.filled='1'}}"
+        "function dbQs(){const q=new URLSearchParams();q.set('mode',$('db_mode')?.value||'executivo');[['estado','db_estado_f','Todos'],['prioridade','db_prio_f','Todas'],['responsavel','db_resp_f','Todos'],['projeto','db_proj_f','Todos']].forEach(([k,id,d])=>{const v=$(id)?.value;if(v&&v!==d)q.set(k,v)});if($('db_only_open')?.checked)q.set('only_open','1');return '?'+q.toString()}"
+        "function dbApplyTaskFilters(extra={}){if($('tf_q'))$('tf_q').value='';if($('tf_estado'))$('tf_estado').value=extra.estado||'Todos';"
+        "if($('tf_prio')){const pv=extra.prioridade||'Todas';$('tf_prio').value=(pv==='Todos'?'Todas':pv)}"
+        "if($('tf_resp'))$('tf_resp').value=extra.responsavel||'Todos';if($('tf_projeto'))$('tf_projeto').value=extra.projeto||'Todos';"
         "if($('tf_overdue'))$('tf_overdue').checked=!!extra.overdue;if($('tf_blocked'))$('tf_blocked').checked=!!extra.blocked;"
         "if($('tf_show_done'))$('tf_show_done').checked=!!extra.show_done;"
         "if(extra.open_only&&$('tf_show_done'))$('tf_show_done').checked=false;"
@@ -2944,7 +2951,7 @@ def _patch_html_dashboard(html: str) -> str:
         "function dbOpenAchievementImpact(){dbOpenAchievements()}"
         "function dbOnChartClick(c,p){try{if(!c||!p)return;const pt=(p.points||[])[0];if(!pt)return;const t=String(c.title||'').toLowerCase();"
         "if(c.type==='pie'&&t.includes('estado')){const estado=String(pt.label||'').trim();if(estado)dbOpenTasksWith({estado});return}"
-        "if(c.type==='bar_h'&&t.includes('atras')){const tid=(Array.isArray(c.task_ids)?c.task_ids[pt.pointIndex]:null)||String(pt.y||'').split('—')[0].trim();if(tid&&tid.startsWith('Task')){showPage('tasks');setTimeout(()=>openTaskDetail(tid),0)}return}"
+        "if(c.type==='bar_h'&&t.includes('atras')){const tid=(Array.isArray(c.task_ids)?c.task_ids[pt.pointIndex]:null)||String(pt.y||'').split('—')[0].trim();if(tid&&tid.startsWith('Task')){openTaskDetail(tid)}return}"
         "}catch(_){}}"
         "function ensurePlotly(){return new Promise(res=>{if(window.Plotly)return res();const s=document.createElement('script');s.src='https://cdn.plot.ly/plotly-2.27.0.min.js';s.onload=res;document.head.appendChild(s)})}"
         "function ensureHtml2Canvas(){return new Promise((res,rej)=>{if(window.html2canvas)return res();const s=document.createElement('script');s.src='https://cdn.jsdelivr.net/npm/html2canvas@1.4.1/dist/html2canvas.min.js';s.onload=res;s.onerror=rej;document.head.appendChild(s)})}"
@@ -4517,10 +4524,13 @@ def _dashboard_efficiency_charts(base_mod: Any, st: Any, q: dict[str, list[str]]
     filters = {
         "q": _q1(q, "q", ""),
         "estado": _q1(q, "estado", "Todos"),
-        "prioridade": _q1(q, "prioridade", "Todos"),
+        "prioridade": _q1(q, "prioridade", "Todas"),
         "responsavel": _q1(q, "responsavel", "Todos"),
         "projeto": _q1(q, "projeto", "Todos"),
     }
+    # Aceitar legado "Todos" no filtro de prioridade (UI antiga / prefs).
+    if str(filters.get("prioridade") or "") == "Todos":
+        filters["prioridade"] = "Todas"
     only_open = _q1(q, "only_open", "") in ("1", "true", "yes", "on")
     display = getattr(st, "display_name", st.username) or st.username
     # Precisa de concluídas para agregar por DataConclusao (salvo only_open).
@@ -6046,6 +6056,24 @@ def _patch_database(Database, base_mod):
         )
 
     Database.__init__ = __init__  # type: ignore[method-assign]
+
+    _orig_set_task_pasta = getattr(Database, "set_task_pasta", None)
+    if callable(_orig_set_task_pasta):
+
+        def set_task_pasta(self, task_id: str, pasta_rel: str, username: str = "", display: str = "", role: str = ""):  # type: ignore[override]
+            st = getattr(base_mod, "STATE", None)
+            if not username and st is not None:
+                username = str(getattr(st, "username", "") or "")
+            if not display and st is not None:
+                display = str(getattr(st, "display_name", None) or username or "")
+            if not role and st is not None:
+                role = str(getattr(st, "role", "") or "")
+            tasks = getattr(self, "_tasks", None)
+            if tasks is not None and hasattr(tasks, "set_task_pasta"):
+                return tasks.set_task_pasta(task_id, pasta_rel, username, display, role)
+            return _orig_set_task_pasta(self, task_id, pasta_rel)
+
+        Database.set_task_pasta = set_task_pasta  # type: ignore[method-assign]
 
     if not hasattr(Database, "fetch_task_row"):
 

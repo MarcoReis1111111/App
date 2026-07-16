@@ -13,7 +13,7 @@ try:
 except Exception:
     pyodbc = None
 
-TASK_STATES_DEFAULT = ("Não iniciado", "A Fazer", "Em Progresso", "Concluído")
+TASK_STATES_DEFAULT = ("Não iniciado", "A Fazer", "Em Progresso", "Bloqueado", "Concluído")
 TASK_PRIORITIES_DEFAULT = ("Baixa", "Média", "Alta")
 TASK_DB_COLS = [
     "TaskID", "Tarefa", "DescricaoNotas", "Milestone", "Assunto", "DataRegisto", "InicioPrevisto", "Responsavel",
@@ -185,15 +185,23 @@ class TasksDataAccess:
         blocked: Dict[str, int] = {}
         try:
             cur = conn.cursor()
+            # Inclui variantes com/sem acento; filtra concluídas em Python via is_done_estado.
             cur.execute("""
-SELECT TaskID, COALESCE(owner,''), COALESCE(workers,''), COALESCE(status,'')
+SELECT TaskID, COALESCE(owner,''), COALESCE(workers,''), COALESCE(status,''), COALESCE(done,0)
 FROM dbo.task_checklist
-WHERE COALESCE(kind,'CHECK')=N'ACTION' AND COALESCE(status,'')!=N'Concluído';
+WHERE COALESCE(kind,'CHECK')=N'ACTION';
 """)
             user_map = self.user_map(conn)
-            for tid, owner, workers, status in cur.fetchall():
+            for tid, owner, workers, status, done in cur.fetchall():
                 tid = str(tid or "")
-                if status == "Bloqueado":
+                st = str(status or "")
+                try:
+                    done_i = int(done or 0)
+                except Exception:
+                    done_i = 0
+                if is_done_estado(st) or done_i:
+                    continue
+                if st.strip() == "Bloqueado":
                     blocked[tid] = int(blocked.get(tid, 0)) + 1
                 arr: List[str] = []
                 o = str(owner or "").strip()

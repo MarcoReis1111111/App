@@ -208,7 +208,7 @@ FROM dbo.tasks t ORDER BY t.id;
         responsavel = str(d.get("Responsavel") or "")
         if f.get("estado") and f["estado"] not in ("Todos", "") and estado != f["estado"]:
             return False
-        if f.get("prioridade") and f["prioridade"] not in ("Todas", "") and str(d.get("Prioridade") or "") != f["prioridade"]:
+        if f.get("prioridade") and f["prioridade"] not in ("Todas", "Todos", "") and str(d.get("Prioridade") or "") != f["prioridade"]:
             return False
         if f.get("milestone") and f["milestone"] not in ("Todos", "") and str(d.get("Milestone") or "") != f["milestone"]:
             return False
@@ -633,12 +633,38 @@ WHERE TaskID=?{deleted_filter};
             conn.commit()
             return final_tid
 
-    def set_task_pasta(self, task_id: str, pasta_rel: str) -> None:
+    def set_task_pasta(
+        self,
+        task_id: str,
+        pasta_rel: str,
+        username: str = "",
+        display: str = "",
+        role: str = "",
+    ) -> None:
         tid = str(task_id or "").strip()
         if not tid:
             raise AppError("TaskID em falta")
+        if not can_edit_role(role):
+            raise PermissionError("Sem permissão para alterar a pasta da tarefa")
         with self.da.lock, self.da.connect() as conn:
-            conn.cursor().execute("UPDATE dbo.tasks SET Pasta=? WHERE TaskID=?;", (str(pasta_rel or "").strip(), tid))
+            row = self.da.fetch_task_row(conn, tid)
+            if not row:
+                raise AppError("Tarefa não encontrada")
+            if not task_visible(
+                int(row.get("Private") or 0),
+                row.get("CreatedBy", ""),
+                row.get("Responsavel", ""),
+                username,
+                display,
+                role,
+            ):
+                raise PermissionError("Sem permissão")
+            if not task_can_edit(row, username, display, role):
+                raise PermissionError("Sem permissão para editar esta tarefa")
+            conn.cursor().execute(
+                "UPDATE dbo.tasks SET Pasta=? WHERE TaskID=?;",
+                (str(pasta_rel or "").strip(), tid),
+            )
             conn.commit()
 
     def update_task(self, task_id: str, values: Dict[str, Any], username: str, display: str, role: str) -> None:
@@ -692,7 +718,7 @@ WHERE TaskID=?{deleted_filter};
                     self.da.add_task_history(
                         conn, tid, username, "change", f"Data conclusão: {stamp}"
                     )
-            if prev_estado.strip() != "Concluído" and new_estado.strip() == "Concluído":
+            if _estado_is_concluido(new_estado) and not _estado_is_concluido(prev_estado):
                 try:
                     arch_row = dict(row)
                     arch_row.update(v)
